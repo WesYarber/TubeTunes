@@ -3,6 +3,7 @@ import Foundation
 /// UserDefaults keys shared by the settings UI (@AppStorage) and the engine.
 enum PrefKey {
     static let checkInterval = "checkIntervalMinutes"
+    static let backgroundSync = "backgroundSync"
     static let reviewManual = "reviewManualDownloads"
     static let cookiesBrowser = "cookiesBrowser"
     static let audioFormat = "audioFormat"
@@ -29,6 +30,7 @@ enum Prefs {
     static func register() {
         d.register(defaults: [
             PrefKey.checkInterval: 30.0,
+            PrefKey.backgroundSync: true,
             PrefKey.reviewManual: true,
             PrefKey.cookiesBrowser: "",
             PrefKey.audioFormat: "aac",
@@ -51,6 +53,7 @@ enum Prefs {
     }
 
     static var checkIntervalMinutes: Double { d.double(forKey: PrefKey.checkInterval) }
+    static var backgroundSync: Bool { d.bool(forKey: PrefKey.backgroundSync) }
     static var reviewManualDownloads: Bool { d.bool(forKey: PrefKey.reviewManual) }
     static var cookiesBrowser: String { d.string(forKey: PrefKey.cookiesBrowser) ?? "" }
     static var audioFormat: String { d.string(forKey: PrefKey.audioFormat) ?? "aac" }

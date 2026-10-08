@@ -17,7 +17,7 @@ struct ArtworkEditor: View {
     @State private var videoProgress: Double?
     @State private var scrub: Double = 0
     @State private var busy = false
-    @State private var applyToAll = false
+    @State private var applyToAll = true
     @State private var error: String?
 
     struct Frame: Identifiable {

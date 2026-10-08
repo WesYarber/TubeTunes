@@ -18,6 +18,8 @@ private struct GeneralSettings: View {
     @AppStorage(PrefKey.reviewManual) private var reviewManual = true
     @AppStorage(PrefKey.cookiesBrowser) private var cookiesBrowser = ""
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @AppStorage(PrefKey.backgroundSync) private var backgroundSync = true
+    @State private var agentNeedsApproval = BackgroundAgent.needsApproval
     @State private var ytVersion: String?
     @State private var updating = false
     @State private var updateMessage: String?
@@ -30,7 +32,18 @@ private struct GeneralSettings: View {
                         Text(m < 60 ? "\(Int(m)) minutes" : "\(Int(m / 60)) hour\(m == 60 ? "" : "s")").tag(m)
                     }
                 }
-                Toggle("Open at login (keeps playlists syncing)", isOn: $launchAtLogin)
+                Toggle("Keep checking playlists in the background when TubeTunes is closed", isOn: $backgroundSync)
+                    .onChange(of: backgroundSync) { _, on in
+                        do { try BackgroundAgent.setEnabled(on) } catch { updateMessage = "Background sync: \(error.localizedDescription)" }
+                        agentNeedsApproval = BackgroundAgent.needsApproval
+                    }
+                if agentNeedsApproval {
+                    HStack {
+                        Text("macOS needs you to allow TubeTunes in Login Items & Extensions.").foregroundStyle(.orange)
+                        Button("Open Settings") { SMAppService.openSystemSettingsLoginItems() }
+                    }
+                }
+                Toggle("Open the app at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in
                         do {
                             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }

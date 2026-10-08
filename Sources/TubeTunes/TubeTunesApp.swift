@@ -1,6 +1,5 @@
 import SwiftUI
 
-@main
 struct TubeTunesApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var lib = Library.shared
@@ -8,7 +7,7 @@ struct TubeTunesApp: App {
 
     init() {
         Prefs.register()
-        Engine.shared.start()
+        Engine.shared.launch()
     }
 
     var body: some Scene {
@@ -82,6 +81,7 @@ struct MenuBarContent: View {
             NSApp.activate(ignoringOtherApps: true)
         }
         Button("Check Playlists Now") { Task { await engine.syncAllPlaylists() } }
+            .disabled(engine.waitingForBackgroundSync)
         SettingsLink { Text("Settings…") }
         Divider()
         Button("Quit TubeTunes") { NSApp.terminate(nil) }

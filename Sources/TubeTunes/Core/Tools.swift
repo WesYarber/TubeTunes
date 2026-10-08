@@ -17,6 +17,9 @@ enum ToolError: LocalizedError {
 
 /// Runs the command-line tools (yt-dlp, ffmpeg) the app is built on.
 enum Tools {
+    /// Run tools at background priority (set by the headless background sync).
+    nonisolated(unsafe) static var lowPriority = false
+
     static let searchPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
                               NSHomeDirectory() + "/.local/bin"]
 
@@ -41,6 +44,7 @@ enum Tools {
         process.arguments = args
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
+        if lowPriority { process.qualityOfService = .background }
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
         process.standardError = err

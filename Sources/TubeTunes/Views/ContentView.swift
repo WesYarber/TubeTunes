@@ -38,6 +38,14 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showAdd) { AddLinkSheet() }
+        .overlay {
+            if engine.waitingForBackgroundSync {
+                ZStack {
+                    Rectangle().fill(.regularMaterial)
+                    ProgressView("Finishing a background sync…")
+                }
+            }
+        }
         .safeAreaInset(edge: .top) {
             if !missingTools.isEmpty {
                 Text("Missing tools: \(missingTools.joined(separator: ", ")). Install with: brew install yt-dlp ffmpeg")

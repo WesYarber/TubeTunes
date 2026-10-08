@@ -16,6 +16,8 @@ struct EditorView: View {
     @State private var zoom: Double = 1
     @State private var viewStart: Double = 0
     @State private var overviewDragStart: Double?
+    /// Like Logic's Catch: the view follows the playhead until you scroll away.
+    @State private var followPlayhead = true
     @State private var showDetect = false
     @State private var artworkFor: UUID?
     @State private var message: String?
@@ -49,7 +51,7 @@ struct EditorView: View {
                 Divider()
                 footer(item)
             }
-            .background(SpacebarCatcher { player.toggle() })
+            .background(SpacebarCatcher { togglePlay() })
             .navigationTitle(item.title)
             .task(id: item.previewFile) { await load(item) }
             .onAppear { history.undoManager = undoManager }
@@ -153,8 +155,25 @@ struct EditorView: View {
     }
 
     private func follow(_ t: Double) {
-        guard player.isPlaying, zoom > 1, !visibleRange.contains(t) else { return }
+        guard followPlayhead, player.isPlaying, zoom > 1, !visibleRange.contains(t) else { return }
         setViewStart(t - visibleSpan * 0.1)
+    }
+
+    /// Starting playback re-engages following, like Logic.
+    private func togglePlay() {
+        if !player.isPlaying { followPlayhead = true }
+        player.toggle()
+    }
+
+    private func play(from: Double, until: Double?) {
+        followPlayhead = true
+        player.play(from: from, until: until)
+    }
+
+    /// The user moved the view themselves: stop following the playhead.
+    private func scrollManually(to t: Double) {
+        followPlayhead = false
+        setViewStart(t)
     }
 
     private func timeline(_ item: DownloadItem) -> some View {
@@ -173,15 +192,19 @@ struct EditorView: View {
         )
         .background(ScrollZoomCatcher(
             onScroll: { dx, dy, option, fx in
+                followPlayhead = false
                 if option {
                     setZoom(zoom * (1 + Double(dy) / 200), anchor: Double(fx))
                 } else {
                     // Trackpad swipes and mouse wheels both pan the timeline.
                     let delta = abs(dx) >= abs(dy) ? dx : dy
-                    setViewStart(viewStart - Double(delta) / 900 * visibleSpan)
+                    scrollManually(to: viewStart - Double(delta) / 900 * visibleSpan)
                 }
             },
-            onMagnify: { m, fx in setZoom(zoom * (1 + Double(m)), anchor: Double(fx)) }
+            onMagnify: { m, fx in
+                followPlayhead = false
+                setZoom(zoom * (1 + Double(m)), anchor: Double(fx))
+            }
         ))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator))
@@ -219,7 +242,7 @@ struct EditorView: View {
                             let t = v.startLocation.x / w * duration
                             overviewDragStart = visibleRange.contains(t) ? viewStart : t - visibleSpan / 2
                         }
-                        setViewStart((overviewDragStart ?? 0) + v.translation.width / w * duration)
+                        scrollManually(to: (overviewDragStart ?? 0) + v.translation.width / w * duration)
                     }
                     .onEnded { _ in overviewDragStart = nil }
             )
@@ -230,10 +253,18 @@ struct EditorView: View {
 
     private func transport(_ item: DownloadItem) -> some View {
         HStack(spacing: 10) {
-            Button { player.toggle() } label: {
+            Button { togglePlay() } label: {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").frame(width: 18)
             }
             .help("Play/Pause (Space)")
+            Toggle(isOn: Binding(get: { followPlayhead }, set: { on in
+                followPlayhead = on
+                if on, !visibleRange.contains(player.currentTime) { setViewStart(player.currentTime - visibleSpan * 0.1) }
+            })) {
+                Image(systemName: "arrow.right.to.line")
+            }
+            .toggleStyle(.button)
+            .help("Follow the playhead while playing. Scrolling turns this off; pressing play turns it back on.")
             Text("\(formatTime(player.currentTime, precise: true)) / \(formatTime(item.duration))")
                 .monospacedDigit().foregroundStyle(.secondary).frame(width: 130, alignment: .leading)
 
@@ -298,7 +329,7 @@ struct EditorView: View {
                 }
                 .tag(seg.id)
                 .contextMenu {
-                    Button("Play") { player.play(from: seg.start, until: seg.end) }
+                    Button("Play") { play(from: seg.start, until: seg.end) }
                     Button("Merge with Next") { merge(seg.id) }.disabled(index == segments.count - 1)
                     Divider()
                     Button("Delete", role: .destructive) { delete(seg.id) }.disabled(segments.count == 1)
@@ -319,7 +350,7 @@ struct EditorView: View {
                 lookingUp: lookingUp,
                 playhead: player.currentTime,
                 maxEnd: item.duration,
-                onPlay: { from, to in player.play(from: from, until: to) },
+                onPlay: { from, to in play(from: from, until: to) },
                 onChooseArtwork: { artworkFor = seg.id },
                 onLookup: { lookup(seg) },
                 onApplyToAll: { applyToAll(from: seg) },

@@ -110,13 +110,13 @@ enum Notifier {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    static func post(_ title: String, _ body: String) {
+    static func post(_ title: String, _ body: String) async {
         guard available else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString,
-                                                                     content: content, trigger: nil))
+        try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString,
+                                                                              content: content, trigger: nil))
     }
 }
 
@@ -135,9 +135,38 @@ final class Engine {
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
     private let maxConcurrent = 2
 
-    func start() {
+    /// True while the app waits for a background sync to finish before taking over the library.
+    var waitingForBackgroundSync = false
+
+    /// App launch: wait for any running background sync to finish, then take over.
+    func launch() {
         guard !started else { return }
         started = true
+        BackgroundAgent.syncWithPreference()
+        Task {
+            while !SyncLock.shared.tryAcquire() {
+                waitingForBackgroundSync = true
+                try? await Task.sleep(for: .seconds(1))
+            }
+            if waitingForBackgroundSync {
+                lib.reload()
+                waitingForBackgroundSync = false
+            }
+            prepare()
+            Notifier.requestAuthorization()
+            pump()
+            monitor = Task { [weak self] in
+                while !Task.isCancelled {
+                    await self?.syncDuePlaylists()
+                    try? await Task.sleep(for: .seconds(60))
+                }
+            }
+        }
+    }
+
+    /// Cleans up after an interrupted run and removed downloads.
+    private func prepare() {
+        lib.purgeRemovedFiles()
         for item in lib.items {
             switch item.status {
             case .downloading, .processing:
@@ -147,15 +176,32 @@ final class Engine {
             default: break
             }
         }
-        Notifier.requestAuthorization()
+    }
+
+    private func isDue(_ p: Playlist) -> Bool {
+        guard p.enabled else { return false }
+        guard let last = p.lastChecked else { return true }
+        // A minute of slack so a check isn't skipped because the timer fired a little early.
+        return Date().timeIntervalSince(last) >= max(5, Prefs.checkIntervalMinutes) * 60 - 60
+    }
+
+    /// Cheap test the background agent runs before doing anything (just reads the library).
+    var hasBackgroundWork: Bool {
+        lib.playlists.contains(where: isDue)
+            || lib.items.contains { [.queued, .downloading, .processing].contains($0.status) }
+    }
+
+    /// One headless pass: check due playlists, download/add anything new, then return.
+    func runBackgroundPass() async {
+        prepare()
+        await syncDuePlaylists()
         pump()
-        monitor = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.syncAllPlaylists()
-                let minutes = max(5, Prefs.checkIntervalMinutes)
-                try? await Task.sleep(for: .seconds(minutes * 60))
-            }
-        }
+        while !active.isEmpty { try? await Task.sleep(for: .seconds(1)) }
+    }
+
+    func syncDuePlaylists() async {
+        for p in lib.playlists where isDue(p) { await sync(p.id) }
+        lastSync = Date()
     }
 
     // MARK: - Queue
@@ -256,6 +302,7 @@ final class Engine {
                                                    setlist: setlist, thumbArt: thumbArt)
             lib.update(id) { $0.segments = segments; $0.status = .needsReview }
 
+            NSLog("Processed \(info.title) (\(segments.count) track(s)); auto-add: \(item.autoAdd)")
             if item.autoAdd { await exportAndAdd(id) }
         } catch is CancellationError {
             lib.update(id) { $0.status = .failed; $0.errorMessage = "Cancelled" }
@@ -341,18 +388,22 @@ final class Engine {
                 added.append(result.persistentID)
                 addedTitles.append(seg.title)
             }
-            for pid in leftovers { await MusicApp.delete(persistentID: pid) }
+            // Music may hand back an existing track when the same song is added again;
+            // never delete something that was just (re)added.
+            for pid in leftovers.subtracting(added) { await MusicApp.delete(persistentID: pid) }
+            NSLog("Added \(added.count) track(s) from \(item.title) to Music")
             lib.update(id) {
                 $0.status = .added
                 $0.completed = Date()
                 $0.musicTrackIDs = added
             }
             if item.autoAdd, !addedTitles.isEmpty {
-                Notifier.post("Added to Music", addedTitles.count == 1
+                await Notifier.post("Added to Music", addedTitles.count == 1
                               ? "\(addedTitles[0]) — \(item.segments.first?.artist ?? "")"
                               : "\(addedTitles.count) tracks from \(item.title)")
             }
         } catch {
+            NSLog("Adding \(item.title) to Music failed: \(error.localizedDescription)")
             lib.update(id) {
                 $0.status = .needsReview
                 $0.errorMessage = error.localizedDescription

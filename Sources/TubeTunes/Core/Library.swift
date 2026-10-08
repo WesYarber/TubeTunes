@@ -27,8 +27,10 @@ final class Library {
         root = base.appendingPathComponent("TubeTunes", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         load()
-        purgeRemovedFiles()
     }
+
+    /// Re-reads the library after another process (the background agent) changed it.
+    func reload() { load() }
 
     private func load() {
         guard let data = try? Data(contentsOf: dbURL) else { return }
@@ -105,7 +107,7 @@ final class Library {
     }
 
     /// Deletes files left behind by downloads that were removed.
-    private func purgeRemovedFiles() {
+    func purgeRemovedFiles() {
         let fm = FileManager.default
         let keep = Set(items.map(\.id.uuidString))
         for sub in ["Items", "Exports"] {
