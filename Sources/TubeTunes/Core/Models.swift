@@ -74,6 +74,8 @@ struct DownloadItem: Codable, Identifiable, Hashable {
     /// Song names found in the description ("SET LIST" / "Tracklist" blocks).
     var setlist: [String] = []
     var segments: [Segment] = []
+    /// Music tracks this download has added and that should still exist (cleaned up on the next export).
+    var musicTrackIDs: [String]?
     var created = Date()
     var completed: Date?
 

@@ -5,6 +5,8 @@ import UniformTypeIdentifiers
 struct ArtworkEditor: View {
     let itemID: UUID
     let segmentID: UUID
+    /// Called with the saved artwork file name and whether it applies to every track.
+    var onSave: (String, Bool) -> Void
     @Environment(Library.self) private var lib
     @Environment(\.dismiss) private var dismiss
 
@@ -258,11 +260,7 @@ struct ArtworkEditor: View {
             self.error = error.localizedDescription
             return
         }
-        lib.update(itemID) { item in
-            for i in item.segments.indices where applyToAll || item.segments[i].id == segmentID {
-                item.segments[i].artworkFile = name
-            }
-        }
+        onSave(name, applyToAll)
         dismiss()
     }
 }

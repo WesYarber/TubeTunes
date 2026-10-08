@@ -6,16 +6,25 @@ struct EditorView: View {
     @Environment(Library.self) private var lib
     @Environment(Engine.self) private var engine
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.undoManager) private var undoManager
 
     @State private var player = PreviewPlayer()
+    @State private var history: SegmentHistory
     @State private var envelope: [Float] = []
     @State private var envelopeRange: ClosedRange<Float> = -60...0
     @State private var selection: UUID?
     @State private var zoom: Double = 1
+    @State private var viewStart: Double = 0
+    @State private var overviewDragStart: Double?
     @State private var showDetect = false
     @State private var artworkFor: UUID?
     @State private var message: String?
     @State private var lookingUp = false
+
+    init(itemID: UUID) {
+        self.itemID = itemID
+        _history = State(initialValue: SegmentHistory(itemID: itemID))
+    }
 
     private var item: DownloadItem? { lib.item(itemID) }
     private var segments: [Segment] { item?.segments ?? [] }
@@ -26,7 +35,11 @@ struct EditorView: View {
             VStack(spacing: 0) {
                 header(item)
                 Divider()
-                timeline(item).frame(height: 150).padding(.horizontal, 12).padding(.vertical, 8)
+                VStack(spacing: 4) {
+                    timeline(item).frame(height: 150)
+                    overview(item)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
                 transport(item).padding(.horizontal, 12).padding(.bottom, 8)
                 Divider()
                 HSplitView {
@@ -36,18 +49,29 @@ struct EditorView: View {
                 Divider()
                 footer(item)
             }
+            .background(SpacebarCatcher { player.toggle() })
             .navigationTitle(item.title)
             .task(id: item.previewFile) { await load(item) }
+            .onAppear { history.undoManager = undoManager }
+            .onChange(of: undoManager) { _, um in history.undoManager = um }
             .onChange(of: segments) { _, segs in player.applyFades(segs) }
-            .onDisappear { player.stop() }
+            .onChange(of: player.currentTime) { _, t in follow(t) }
+            .onDisappear {
+                player.stop()
+                history.detach()
+            }
             .sheet(isPresented: $showDetect) {
                 DetectSongsSheet(item: item, envelope: envelope) { ranges, names in
-                    replaceSegments(ranges: ranges, names: names)
+                    replaceSegments(ranges: ranges, names: names, actionName: "Detect Songs")
                 }
             }
             .sheet(item: Binding(get: { artworkFor.map(IdentifiedUUID.init) }, set: { artworkFor = $0?.id })) { target in
-                ArtworkEditor(itemID: itemID, segmentID: target.id)
-                    .environment(lib)
+                ArtworkEditor(itemID: itemID, segmentID: target.id) { file, all in
+                    history.change(all ? "Set Artwork for All Tracks" : "Set Artwork") { segs in
+                        for i in segs.indices where all || segs[i].id == target.id { segs[i].artworkFile = file }
+                    }
+                }
+                .environment(lib)
             }
             .alert("TubeTunes", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
                 Button("OK") {}
@@ -65,7 +89,7 @@ struct EditorView: View {
         await player.load(preview)
         player.applyFades(item.segments)
         if let source = lib.file(item, item.sourceFile) {
-            let cache = lib.folder(for: item.id).appendingPathComponent("envelope.bin")
+            let cache = lib.folder(for: item.id).appendingPathComponent(AudioTools.envelopeCacheName)
             let env = (try? await AudioTools.envelope(source: source, cache: cache)) ?? []
             if !env.isEmpty {
                 let sorted = env.sorted()
@@ -102,33 +126,106 @@ struct EditorView: View {
         .padding(12)
     }
 
-    // MARK: - Timeline
+    // MARK: - Timeline viewport
+
+    private var duration: Double { max(1, item?.duration ?? 1) }
+    private var maxZoom: Double { max(1, duration / 3) }
+    private var visibleSpan: Double { duration / zoom }
+    private var visibleRange: ClosedRange<Double> { viewStart...(viewStart + visibleSpan) }
+
+    /// Zooms keeping the time under `anchor` (fraction of the width) in place.
+    private func setZoom(_ newZoom: Double, anchor: Double) {
+        let z = min(max(1, newZoom), maxZoom)
+        let anchorTime = viewStart + anchor * visibleSpan
+        zoom = z
+        setViewStart(anchorTime - anchor * (duration / z))
+    }
+
+    private func setViewStart(_ t: Double) {
+        viewStart = min(max(0, t), max(0, duration - visibleSpan))
+    }
+
+    /// Zoom from the slider/buttons: keep the playhead in place if it's visible, else the center.
+    private func zoomAroundPlayhead(_ newZoom: Double) {
+        let t = player.currentTime
+        let anchor = visibleRange.contains(t) ? (t - viewStart) / visibleSpan : 0.5
+        setZoom(newZoom, anchor: anchor)
+    }
+
+    private func follow(_ t: Double) {
+        guard player.isPlaying, zoom > 1, !visibleRange.contains(t) else { return }
+        setViewStart(t - visibleSpan * 0.1)
+    }
 
     private func timeline(_ item: DownloadItem) -> some View {
-        GeometryReader { geo in
-            ScrollView(.horizontal) {
-                WaveformTimeline(
-                    envelope: envelope,
-                    range: envelopeRange,
-                    duration: item.duration,
-                    segments: segments,
-                    chapters: item.chapters,
-                    selection: selection,
-                    playhead: player.currentTime,
-                    onSeek: { player.seek($0) },
-                    onSelect: { if let id = $0 { selection = id } },
-                    onMoveEdge: moveEdge
-                )
-                .frame(width: geo.size.width * zoom, height: geo.size.height)
-            }
-            .overlay {
-                if envelope.isEmpty {
-                    ProgressView("Reading audio…").controlSize(.small)
+        WaveformTimeline(
+            envelope: envelope,
+            range: envelopeRange,
+            duration: item.duration,
+            visible: visibleRange,
+            segments: segments,
+            chapters: item.chapters,
+            selection: selection,
+            playhead: player.currentTime,
+            onSeek: { player.seek($0) },
+            onSelect: { if let id = $0 { selection = id } },
+            onMoveEdge: moveEdge
+        )
+        .background(ScrollZoomCatcher(
+            onScroll: { dx, dy, option, fx in
+                if option {
+                    setZoom(zoom * (1 + Double(dy) / 200), anchor: Double(fx))
+                } else {
+                    // Trackpad swipes and mouse wheels both pan the timeline.
+                    let delta = abs(dx) >= abs(dy) ? dx : dy
+                    setViewStart(viewStart - Double(delta) / 900 * visibleSpan)
                 }
-            }
-        }
+            },
+            onMagnify: { m, fx in setZoom(zoom * (1 + Double(m)), anchor: Double(fx)) }
+        ))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator))
+        .overlay {
+            if envelope.isEmpty { ProgressView("Reading audio…").controlSize(.small) }
+        }
+        .help("Pinch to zoom, swipe to scroll, drag the edges to trim")
+    }
+
+    /// Thin bar showing which part of the video is on screen; drag it to scroll.
+    private func overview(_ item: DownloadItem) -> some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let x0 = viewStart / duration * w
+            let width = max(8, visibleSpan / duration * w)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.15))
+                ForEach(segments) { seg in
+                    Rectangle().fill(Color.accentColor.opacity(seg.included ? 0.35 : 0.1))
+                        .frame(width: max(1, seg.duration / duration * w - 1))
+                        .offset(x: seg.start / duration * w)
+                }
+                Capsule().stroke(Color.primary.opacity(0.6), lineWidth: 1.5)
+                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    .frame(width: width)
+                    .offset(x: x0)
+                Rectangle().fill(Color.red).frame(width: 1).offset(x: player.currentTime / duration * w)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        if overviewDragStart == nil {
+                            // Clicking outside the window jumps there; dragging inside moves it.
+                            let t = v.startLocation.x / w * duration
+                            overviewDragStart = visibleRange.contains(t) ? viewStart : t - visibleSpan / 2
+                        }
+                        setViewStart((overviewDragStart ?? 0) + v.translation.width / w * duration)
+                    }
+                    .onEnded { _ in overviewDragStart = nil }
+            )
+        }
+        .frame(height: 10)
+        .opacity(zoom > 1.01 ? 1 : 0.35)
     }
 
     private func transport(_ item: DownloadItem) -> some View {
@@ -136,23 +233,27 @@ struct EditorView: View {
             Button { player.toggle() } label: {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").frame(width: 18)
             }
+            .help("Play/Pause (Space)")
             Text("\(formatTime(player.currentTime, precise: true)) / \(formatTime(item.duration))")
                 .monospacedDigit().foregroundStyle(.secondary).frame(width: 130, alignment: .leading)
 
             Divider().frame(height: 18)
 
             Button("Split at Playhead", systemImage: "scissors") { splitAtPlayhead() }
+                .keyboardShortcut("b", modifiers: .command)
+                .help("Split the track under the playhead (⌘B)")
             Menu {
                 Button("Use Chapters (\(item.chapters.count))") { useChapters() }
                     .disabled(item.chapters.isEmpty)
                 Button("Detect Songs…") { showDetect = true }
                     .disabled(envelope.isEmpty)
                 Button("Single Track (Whole Video)") {
-                    replaceSegments(ranges: [0...item.duration], names: [segments.first?.title ?? item.title])
+                    replaceSegments(ranges: [0...item.duration], names: [segments.first?.title ?? item.title],
+                                    actionName: "Make Single Track")
                 }
                 Divider()
                 Button("Number Tracks 1…\(segments.filter(\.included).count)") {
-                    mutate { SegmentBuilder.number(&$0) }
+                    history.change("Number Tracks") { SegmentBuilder.number(&$0) }
                 }
             } label: {
                 Label("Split", systemImage: "rectangle.split.3x1")
@@ -161,9 +262,15 @@ struct EditorView: View {
 
             Spacer()
 
-            Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
-            Slider(value: $zoom, in: 1...40).frame(width: 140)
-            Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
+            Button { zoomAroundPlayhead(zoom / 1.6) } label: { Image(systemName: "minus.magnifyingglass") }
+                .keyboardShortcut("-", modifiers: .command)
+                .help("Zoom out (⌘−)")
+            Slider(value: Binding(get: { log(zoom) }, set: { zoomAroundPlayhead(exp($0)) }),
+                   in: 0...max(0.01, log(maxZoom)))
+                .frame(width: 140)
+            Button { zoomAroundPlayhead(zoom * 1.6) } label: { Image(systemName: "plus.magnifyingglass") }
+                .keyboardShortcut("=", modifiers: .command)
+                .help("Zoom in (⌘+)")
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
@@ -175,7 +282,8 @@ struct EditorView: View {
         List(selection: $selection) {
             ForEach(Array(segments.enumerated()), id: \.element.id) { index, seg in
                 HStack(spacing: 8) {
-                    Toggle("", isOn: segmentBinding(seg.id).included).labelsHidden().toggleStyle(.checkbox)
+                    Toggle("", isOn: segmentBinding(seg.id, name: seg.included ? "Exclude Track" : "Include Track").included)
+                        .labelsHidden().toggleStyle(.checkbox)
                     ArtworkImage(url: item.flatMap { lib.file($0, seg.artworkFile) }, size: 30)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("\(index + 1). \(seg.title)").lineLimit(1)
@@ -205,7 +313,7 @@ struct EditorView: View {
     private func detail(_ item: DownloadItem) -> some View {
         if let seg = selected {
             SegmentDetail(
-                segment: segmentBinding(seg.id),
+                segment: segmentBinding(seg.id, name: "Edit Track"),
                 artworkURL: lib.file(item, seg.artworkFile),
                 trackCount: segments.count,
                 lookingUp: lookingUp,
@@ -226,11 +334,14 @@ struct EditorView: View {
 
     private func footer(_ item: DownloadItem) -> some View {
         let included = segments.filter(\.included)
-        let alreadyAdded = segments.contains { $0.musicPersistentID != nil }
+        let alreadyAdded = !(item.musicTrackIDs ?? []).isEmpty || segments.contains { $0.musicPersistentID != nil }
         return HStack {
             if let error = item.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red).lineLimit(2).font(.callout)
+            } else if alreadyAdded && item.status == .needsReview {
+                Label("Edited since it was added. Update to apply the changes in Music.", systemImage: "pencil.circle")
+                    .foregroundStyle(.orange)
             } else {
                 Text("\(included.count) of \(segments.count) tracks will be added")
                     .foregroundStyle(.secondary)
@@ -246,32 +357,29 @@ struct EditorView: View {
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(included.isEmpty || item.status == .exporting)
+            .disabled((included.isEmpty && !alreadyAdded) || item.status == .exporting)
             .help(alreadyAdded ? "Re-exports the tracks and replaces the earlier versions in Music" : "")
         }
         .padding(12)
     }
 
-    // MARK: - Editing
+    // MARK: - Editing (every change goes through `history` so it can be undone)
 
-    private func mutate(_ change: (inout [Segment]) -> Void) {
-        lib.update(itemID) {
-            change(&$0.segments)
-            $0.segments.sort { $0.start < $1.start }
-        }
-    }
-
-    private func segmentBinding(_ id: UUID) -> Binding<Segment> {
+    private func segmentBinding(_ id: UUID, name: String) -> Binding<Segment> {
         Binding(
             get: { lib.item(itemID)?.segments.first { $0.id == id } ?? .placeholder },
-            set: { new in mutate { segs in if let i = segs.firstIndex(where: { $0.id == id }) { segs[i] = new } } }
+            set: { new in
+                history.change(name, coalesce: true) { segs in
+                    if let i = segs.firstIndex(where: { $0.id == id }) { segs[i] = new }
+                }
+            }
         )
     }
 
     private func moveEdge(_ id: UUID, _ edge: SegmentEdge, _ time: Double) {
-        mutate { segs in
+        let duration = item?.duration ?? 0
+        history.change(edge == .start ? "Move Track Start" : "Move Track End", coalesce: true) { segs in
             guard let i = segs.firstIndex(where: { $0.id == id }) else { return }
-            let duration = item?.duration ?? 0
             switch edge {
             case .start:
                 let lower = i > 0 ? segs[i - 1].end : 0
@@ -296,7 +404,7 @@ struct EditorView: View {
         second.fadeIn = Prefs.fadeInSplit
         second.musicPersistentID = nil
         second.addedToMusicAt = nil
-        mutate { segs in
+        history.change("Split Track") { segs in
             guard let i = segs.firstIndex(where: { $0.id == seg.id }) else { return }
             segs[i].end = t
             segs[i].fadeOut = Prefs.fadeOutSplit
@@ -306,21 +414,18 @@ struct EditorView: View {
     }
 
     private func merge(_ id: UUID) {
-        guard let i = segments.firstIndex(where: { $0.id == id }), i + 1 < segments.count else { return }
-        let next = segments[i + 1]
-        removeFromMusic([next])
-        mutate { segs in
+        history.change("Merge Tracks") { segs in
+            guard let i = segs.firstIndex(where: { $0.id == id }), i + 1 < segs.count else { return }
+            let next = segs.remove(at: i + 1)
             segs[i].end = next.end
             segs[i].fadeOut = next.fadeOut
-            segs.removeAll { $0.id == next.id }
         }
     }
 
     private func delete(_ id: UUID) {
         guard segments.count > 1 else { return }
-        removeFromMusic(segments.filter { $0.id == id })
-        mutate { $0.removeAll { $0.id == id } }
-        selection = segments.first?.id
+        history.change("Delete Track") { $0.removeAll { $0.id == id } }
+        if selection == id { selection = segments.first?.id }
     }
 
     private func useChapters() {
@@ -335,28 +440,20 @@ struct EditorView: View {
         var new = SegmentBuilder.fromChapters(item.chapters, album: album, artwork: template.artworkFile)
         if new.isEmpty { return }
         for i in new.indices { new[i].albumArtist = template.albumArtist }
-        removeFromMusic(segments)
-        lib.update(itemID) { $0.segments = new }
+        history.change("Split by Chapters") { $0 = new }
         selection = new.first?.id
     }
 
-    private func replaceSegments(ranges: [ClosedRange<Double>], names: [String]) {
+    private func replaceSegments(ranges: [ClosedRange<Double>], names: [String], actionName: String) {
         guard !ranges.isEmpty else { return }
         let template = segments.first ?? .placeholder
         let new = SegmentBuilder.fromRanges(ranges, names: names, template: template)
-        removeFromMusic(segments)
-        lib.update(itemID) { $0.segments = new }
+        history.change(actionName) { $0 = new }
         selection = new.first?.id
     }
 
-    private func removeFromMusic(_ old: [Segment]) {
-        let ids = old.compactMap(\.musicPersistentID)
-        guard !ids.isEmpty else { return }
-        Task { for pid in ids { await MusicApp.delete(persistentID: pid) } }
-    }
-
     private func applyToAll(from seg: Segment) {
-        mutate { segs in
+        history.change("Apply to All Tracks") { segs in
             for i in segs.indices {
                 segs[i].artist = seg.artist
                 segs[i].album = seg.album
@@ -381,19 +478,19 @@ struct EditorView: View {
             MetadataResolver.apply(c, to: &meta)
             MetadataResolver.finalize(&meta)
             let art = await engine.downloadArtwork(meta.artworkURL, dir: lib.folder(for: itemID))
-            let binding = segmentBinding(seg.id)
-            var s = binding.wrappedValue
-            s.title = meta.title
-            s.artist = meta.artist
-            s.album = meta.album
-            s.albumArtist = meta.albumArtist
-            s.trackNumber = meta.trackNumber
-            s.trackCount = meta.trackCount
-            s.year = meta.year
-            s.genre = meta.genre
-            s.metadataSource = meta.source
-            if let art { s.artworkFile = art }
-            binding.wrappedValue = s
+            history.change("Apple Music Lookup") { segs in
+                guard let i = segs.firstIndex(where: { $0.id == seg.id }) else { return }
+                segs[i].title = meta.title
+                segs[i].artist = meta.artist
+                segs[i].album = meta.album
+                segs[i].albumArtist = meta.albumArtist
+                segs[i].trackNumber = meta.trackNumber
+                segs[i].trackCount = meta.trackCount
+                segs[i].year = meta.year
+                segs[i].genre = meta.genre
+                segs[i].metadataSource = meta.source
+                if let art { segs[i].artworkFile = art }
+            }
         }
     }
 }
@@ -432,17 +529,17 @@ struct SegmentDetail: View {
                     .buttonStyle(.plain)
                     .help("Pick a frame from the video or crop a thumbnail")
                     VStack(alignment: .leading, spacing: 8) {
-                        TextField("Title", text: $segment.title)
-                        TextField("Artist", text: $segment.artist)
-                        TextField("Album", text: $segment.album)
-                        TextField("Album Artist", text: $segment.albumArtist)
+                        CommitTextField("Title", text: $segment.title)
+                        CommitTextField("Artist", text: $segment.artist)
+                        CommitTextField("Album", text: $segment.album)
+                        CommitTextField("Album Artist", text: $segment.albumArtist)
                     }
                 }
                 HStack {
-                    TextField("Track", value: $segment.trackNumber, format: .number).frame(width: 90)
-                    TextField("of", value: $segment.trackCount, format: .number).frame(width: 70)
-                    TextField("Year", text: $segment.year).frame(width: 110)
-                    TextField("Genre", text: $segment.genre)
+                    CommitTextField("Track", text: number($segment.trackNumber)).frame(width: 90)
+                    CommitTextField("of", text: number($segment.trackCount)).frame(width: 70)
+                    CommitTextField("Year", text: $segment.year).frame(width: 110)
+                    CommitTextField("Genre", text: $segment.genre)
                 }
                 HStack {
                     Button(action: onLookup) {
@@ -508,6 +605,11 @@ struct SegmentDetail: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func number(_ value: Binding<Int?>) -> Binding<String> {
+        Binding(get: { value.wrappedValue.map(String.init) ?? "" },
+                set: { value.wrappedValue = Int($0.trimmingCharacters(in: .whitespaces)) })
     }
 
     private func fadeRow(_ label: String, value: Binding<Double>) -> some View {

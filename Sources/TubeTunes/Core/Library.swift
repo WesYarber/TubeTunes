@@ -27,6 +27,7 @@ final class Library {
         root = base.appendingPathComponent("TubeTunes", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         load()
+        purgeRemovedFiles()
     }
 
     private func load() {
@@ -97,11 +98,23 @@ final class Library {
 
     func hasVideo(_ videoID: String) -> Bool { items.contains { $0.videoID == videoID } }
 
+    /// Removes the record only; its files stay until the next launch so the removal can be undone.
     func removeItem(_ id: UUID) {
         items.removeAll { $0.id == id }
-        try? FileManager.default.removeItem(at: root.appendingPathComponent("Items/\(id.uuidString)"))
-        try? FileManager.default.removeItem(at: root.appendingPathComponent("Exports/\(id.uuidString)"))
         save()
+    }
+
+    /// Deletes files left behind by downloads that were removed.
+    private func purgeRemovedFiles() {
+        let fm = FileManager.default
+        let keep = Set(items.map(\.id.uuidString))
+        for sub in ["Items", "Exports"] {
+            let dir = root.appendingPathComponent(sub)
+            for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+            where UUID(uuidString: name) != nil && !keep.contains(name) {
+                try? fm.removeItem(at: dir.appendingPathComponent(name))
+            }
+        }
     }
 
     // MARK: - Playlists
@@ -114,8 +127,32 @@ final class Library {
         save()
     }
 
-    func removePlaylist(_ id: UUID) {
-        playlists.removeAll { $0.id == id }
+    func removePlaylist(_ id: UUID, undoManager: UndoManager? = nil) {
+        guard let index = playlists.firstIndex(where: { $0.id == id }) else { return }
+        let playlist = playlists.remove(at: index)
         save()
+        undoManager?.registerUndo(withTarget: self) { lib in
+            MainActor.assumeIsolated {
+                lib.playlists.insert(playlist, at: min(index, lib.playlists.count))
+                lib.save()
+                undoManager?.registerUndo(withTarget: lib) { l in
+                    MainActor.assumeIsolated { l.removePlaylist(id, undoManager: undoManager) }
+                }
+            }
+        }
+        undoManager?.setActionName("Stop Monitoring Playlist")
+    }
+
+    /// Changes one playlist setting as an undoable step.
+    func setPlaylist<V>(_ id: UUID, _ key: WritableKeyPath<Playlist, V>, _ value: V,
+                        actionName: String, undoManager: UndoManager?) {
+        guard let old = playlist(id)?[keyPath: key] else { return }
+        updatePlaylist(id) { $0[keyPath: key] = value }
+        undoManager?.registerUndo(withTarget: self) { lib in
+            MainActor.assumeIsolated {
+                lib.setPlaylist(id, key, old, actionName: actionName, undoManager: undoManager)
+            }
+        }
+        undoManager?.setActionName(actionName)
     }
 }

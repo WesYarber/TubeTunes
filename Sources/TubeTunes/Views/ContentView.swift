@@ -56,6 +56,7 @@ struct ContentView: View {
 struct QueueView: View {
     @Environment(Library.self) private var lib
     @Environment(Engine.self) private var engine
+    @Environment(\.undoManager) private var undoManager
     @Environment(\.openWindow) private var openWindow
 
     private var items: [DownloadItem] {
@@ -94,7 +95,7 @@ struct QueueView: View {
         if item.status == .failed { Button("Retry") { engine.retry(item.id) } }
         if item.status.isBusy { Button("Cancel") { engine.cancel(item.id) } }
         Divider()
-        Button("Remove", role: .destructive) { engine.remove(item.id) }
+        Button("Remove", role: .destructive) { engine.remove(item.id, undoManager: undoManager) }
     }
 }
 
@@ -129,7 +130,9 @@ struct QueueRow: View {
             switch item.status {
             case .needsReview:
                 Button("Edit…") { openWindow(id: "editor", value: item.id) }
-                Button("Add to Music") { Task { await engine.exportAndAdd(item.id) } }
+                Button((item.musicTrackIDs ?? []).isEmpty ? "Add to Music" : "Update in Music") {
+                    Task { await engine.exportAndAdd(item.id) }
+                }
                     .buttonStyle(.borderedProminent)
             case .failed:
                 Button("Retry") { engine.retry(item.id) }
@@ -226,6 +229,7 @@ struct HistoryView: View {
 struct PlaylistsView: View {
     @Environment(Library.self) private var lib
     @Environment(Engine.self) private var engine
+    @Environment(\.undoManager) private var undoManager
     @State private var confirmRemove: Playlist?
 
     var body: some View {
@@ -251,10 +255,10 @@ struct PlaylistsView: View {
         .confirmationDialog("Stop monitoring “\(confirmRemove?.title ?? "")”?",
                             isPresented: Binding(get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } })) {
             Button("Stop Monitoring", role: .destructive) {
-                if let p = confirmRemove { lib.removePlaylist(p.id) }
+                if let p = confirmRemove { lib.removePlaylist(p.id, undoManager: undoManager) }
             }
         } message: {
-            Text("Tracks already added to Music stay there.")
+            Text("Tracks already added to Music stay there. You can undo this with ⌘Z.")
         }
     }
 
@@ -281,11 +285,11 @@ struct PlaylistsView: View {
             Spacer()
             Toggle("Auto-add to Music", isOn: Binding(
                 get: { p.autoAddToMusic },
-                set: { v in lib.updatePlaylist(p.id) { $0.autoAddToMusic = v } }))
+                set: { v in lib.setPlaylist(p.id, \.autoAddToMusic, v, actionName: "Change Auto-Add", undoManager: undoManager) }))
                 .help("Off: new songs wait in the Queue for review")
             Toggle("Monitor", isOn: Binding(
                 get: { p.enabled },
-                set: { v in lib.updatePlaylist(p.id) { $0.enabled = v } }))
+                set: { v in lib.setPlaylist(p.id, \.enabled, v, actionName: "Change Monitoring", undoManager: undoManager) }))
             Menu {
                 Button("Check Now") { Task { await engine.sync(p.id) } }
                 Button("Open on YouTube") { NSWorkspace.shared.open(URL(string: p.url)!) }

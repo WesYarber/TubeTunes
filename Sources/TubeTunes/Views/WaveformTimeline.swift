@@ -8,6 +8,8 @@ struct WaveformTimeline: View {
     /// Loudness range to draw, from quiet floor to near-peak (dB).
     let range: ClosedRange<Float>
     let duration: Double
+    /// The part of the video currently on screen (zoom/scroll).
+    let visible: ClosedRange<Double>
     let segments: [Segment]
     let chapters: [Chapter]
     let selection: UUID?
@@ -21,13 +23,15 @@ struct WaveformTimeline: View {
     var body: some View {
         GeometryReader { geo in
             let w = geo.size.width, h = geo.size.height
-            let pps = duration > 0 ? w / duration : 0
+            let span = max(0.001, visible.upperBound - visible.lowerBound)
+            let pps = w / span
+            let x = { (t: Double) in (t - visible.lowerBound) * pps }
 
             ZStack(alignment: .topLeading) {
                 Rectangle().fill(Color(nsColor: .controlBackgroundColor))
 
                 ForEach(segments) { seg in
-                    segmentBox(seg, pps: pps, height: h)
+                    segmentBox(seg, x0: x(seg.start), pps: pps, height: h)
                 }
 
                 waveform.frame(width: w, height: h).allowsHitTesting(false)
@@ -35,25 +39,29 @@ struct WaveformTimeline: View {
                 ForEach(chapters, id: \.start) { ch in
                     Rectangle().fill(Color.secondary.opacity(0.5))
                         .frame(width: 1, height: 10)
-                        .offset(x: ch.start * pps)
+                        .offset(x: x(ch.start))
                         .help(ch.title)
                 }
 
                 Rectangle().fill(Color.red)
                     .frame(width: 1.5, height: h)
-                    .offset(x: playhead * pps)
+                    .offset(x: x(playhead))
                     .allowsHitTesting(false)
 
                 ForEach(segments) { seg in
-                    handle(seg, edge: .start, x: seg.start * pps, pps: pps, height: h)
-                    handle(seg, edge: .end, x: seg.end * pps, pps: pps, height: h)
+                    if visible.contains(seg.start) {
+                        handle(seg, edge: .start, x: x(seg.start), pps: pps, height: h)
+                    }
+                    if visible.contains(seg.end) {
+                        handle(seg, edge: .end, x: x(seg.end), pps: pps, height: h)
+                    }
                 }
             }
+            .clipped()
             .coordinateSpace(name: "timeline")
             .contentShape(Rectangle())
             .onTapGesture { location in
-                guard pps > 0 else { return }
-                let t = location.x / pps
+                let t = visible.lowerBound + location.x / pps
                 onSeek(t)
                 onSelect(segments.first { $0.start <= t && t <= $0.end }?.id)
             }
@@ -62,13 +70,18 @@ struct WaveformTimeline: View {
 
     private var waveform: some View {
         Canvas { ctx, size in
+            // `visible` and `duration` are read inside so the canvas redraws on zoom/scroll.
             guard !envelope.isEmpty else { return }
             let columns = max(1, Int(size.width / 2))
             let mid = size.height / 2
+            let rate = Double(envelope.count) / max(1, duration)
+            let first = visible.lowerBound * rate
+            let perColumn = (visible.upperBound - visible.lowerBound) * rate / Double(columns)
             var path = Path()
             for c in 0..<columns {
-                let a = Int(Double(c) / Double(columns) * Double(envelope.count))
-                let b = max(a + 1, Int(Double(c + 1) / Double(columns) * Double(envelope.count)))
+                let a = max(0, Int(first + Double(c) * perColumn))
+                let b = max(a + 1, Int(first + Double(c + 1) * perColumn))
+                guard a < envelope.count else { break }
                 var peak: Float = -90
                 for i in a..<min(b, envelope.count) { peak = max(peak, envelope[i]) }
                 let span = max(6, range.upperBound - range.lowerBound)
@@ -81,8 +94,8 @@ struct WaveformTimeline: View {
     }
 
     @ViewBuilder
-    private func segmentBox(_ seg: Segment, pps: Double, height: CGFloat) -> some View {
-        let x0 = seg.start * pps, width = max(1, seg.duration * pps)
+    private func segmentBox(_ seg: Segment, x0: Double, pps: Double, height: CGFloat) -> some View {
+        let width = max(1, seg.duration * pps)
         let selected = seg.id == selection
         let tint: Color = seg.included ? .accentColor : .gray
         ZStack(alignment: .topLeading) {
@@ -125,7 +138,7 @@ struct WaveformTimeline: View {
                     .onChanged { v in
                         guard pps > 0 else { return }
                         onSelect(seg.id)
-                        onMoveEdge(seg.id, edge, v.location.x / pps)
+                        onMoveEdge(seg.id, edge, visible.lowerBound + v.location.x / pps)
                     }
             )
             .onHover { inside in

@@ -182,9 +182,26 @@ final class Engine {
         tasks[id]?.cancel()
     }
 
-    func remove(_ id: UUID) {
+    /// Removes a download. With an undo manager, Edit › Undo puts it back (its files are kept
+    /// until the next launch).
+    func remove(_ id: UUID, undoManager: UndoManager? = nil) {
+        guard let index = lib.items.firstIndex(where: { $0.id == id }) else { return }
+        var item = lib.items[index]
         tasks[id]?.cancel()
         lib.removeItem(id)
+        guard let undoManager else { return }
+        if item.status.isBusy { item.status = item.segments.isEmpty ? .queued : .needsReview }
+        undoManager.registerUndo(withTarget: self) { engine in
+            MainActor.assumeIsolated {
+                engine.lib.items.insert(item, at: min(index, engine.lib.items.count))
+                engine.lib.save()
+                engine.pump()
+                undoManager.registerUndo(withTarget: engine) { e in
+                    MainActor.assumeIsolated { e.remove(id, undoManager: undoManager) }
+                }
+            }
+        }
+        undoManager.setActionName("Remove Download")
     }
 
     private func pump() {
@@ -266,7 +283,7 @@ final class Engine {
         if splitChapters {
             return SegmentBuilder.fromChapters(chapters, album: album, artwork: art)
         }
-        let env = try await AudioTools.envelope(source: source, cache: dir.appendingPathComponent("envelope.bin"))
+        let env = try await AudioTools.envelope(source: source, cache: dir.appendingPathComponent(AudioTools.envelopeCacheName))
         let ranges = SplitDetector.byCount(env, count: setlist.count, minSong: Prefs.minSong)
         var template = SegmentBuilder.make(album, start: 0, end: 0, artwork: art, split: true)
         template.metadataSource = "Description set list"
@@ -285,19 +302,20 @@ final class Engine {
 
     // MARK: - Music
 
-    /// Exports every included track and adds it to Music, replacing earlier versions.
+    /// Exports every included track and adds it to Music, replacing earlier versions and removing
+    /// tracks that were deleted, merged away or unchecked in the editor since the last export.
     func exportAndAdd(_ id: UUID) async {
         guard let item = lib.item(id), let sourceName = item.sourceFile else { return }
         let dir = lib.folder(for: id)
         let outDir = lib.exportFolder(for: id)
         lib.update(id) { $0.status = .exporting; $0.errorMessage = nil }
+        var leftovers = Set(item.musicTrackIDs ?? []).union(item.segments.compactMap(\.musicPersistentID))
+        var added: [String] = []
         var addedTitles: [String] = []
         do {
             for seg in item.segments {
                 guard seg.included else {
-                    // Unchecked after being added: take it back out of Music.
-                    if let pid = seg.musicPersistentID {
-                        await MusicApp.delete(persistentID: pid)
+                    if seg.musicPersistentID != nil {
                         updateSegment(id, seg.id) { $0.musicPersistentID = nil; $0.addedToMusicAt = nil }
                     }
                     continue
@@ -308,25 +326,39 @@ final class Engine {
                 try await AudioTools.export(seg, source: dir.appendingPathComponent(sourceName),
                                             artwork: seg.artworkFile.map { dir.appendingPathComponent($0) },
                                             sourceURL: item.url, dest: dest)
-                if let old = seg.musicPersistentID { await MusicApp.delete(persistentID: old) }
-                let added = try await MusicApp.add(dest)
-                if let location = added.location, location != dest.path {
+                if let old = seg.musicPersistentID {
+                    await MusicApp.delete(persistentID: old)
+                    leftovers.remove(old)
+                }
+                let result = try await MusicApp.add(dest)
+                if let location = result.location, location != dest.path {
                     try? FileManager.default.removeItem(at: dest)   // Music made its own copy
                 }
                 updateSegment(id, seg.id) {
-                    $0.musicPersistentID = added.persistentID
+                    $0.musicPersistentID = result.persistentID
                     $0.addedToMusicAt = Date()
                 }
+                added.append(result.persistentID)
                 addedTitles.append(seg.title)
             }
-            lib.update(id) { $0.status = .added; $0.completed = Date() }
+            for pid in leftovers { await MusicApp.delete(persistentID: pid) }
+            lib.update(id) {
+                $0.status = .added
+                $0.completed = Date()
+                $0.musicTrackIDs = added
+            }
             if item.autoAdd, !addedTitles.isEmpty {
                 Notifier.post("Added to Music", addedTitles.count == 1
                               ? "\(addedTitles[0]) — \(item.segments.first?.artist ?? "")"
                               : "\(addedTitles.count) tracks from \(item.title)")
             }
         } catch {
-            lib.update(id) { $0.status = .needsReview; $0.errorMessage = error.localizedDescription }
+            lib.update(id) {
+                $0.status = .needsReview
+                $0.errorMessage = error.localizedDescription
+                // Remember everything that may still be in Music so the next try cleans it up.
+                $0.musicTrackIDs = Array(leftovers.union(added))
+            }
         }
     }
 

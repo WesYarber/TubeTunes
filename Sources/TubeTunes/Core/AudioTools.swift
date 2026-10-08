@@ -2,8 +2,9 @@ import Foundation
 
 /// ffmpeg-based audio work: previews, waveforms, frames and the final export.
 enum AudioTools {
-    static let envelopeRate = 20.0   // envelope windows per second
-    private static let pcmRate = 8000
+    static let envelopeRate = 50.0   // envelope windows per second
+    static let envelopeCacheName = "envelope-50.bin"
+    private static let pcmRate = 8000   // divisible by envelopeRate
 
     private static func fmt(_ t: Double) -> String { String(format: "%.3f", t) }
 
@@ -13,7 +14,7 @@ enum AudioTools {
                                        "-c:a", "aac_at", "-b:a", "160k", dest.path])
     }
 
-    /// Loudness (dBFS) per 1/20 s window, cached next to the source.
+    /// Loudness (dBFS) per 1/50 s window, cached next to the source.
     static func envelope(source: URL, cache: URL) async throws -> [Float] {
         if let data = try? Data(contentsOf: cache), !data.isEmpty {
             return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
