@@ -1,0 +1,396 @@
+import Foundation
+import Observation
+import UserNotifications
+
+enum LinkParser {
+    struct Parsed {
+        var videoID: String?
+        var listID: String?
+    }
+
+    static func parse(_ text: String) -> Parsed? {
+        var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.contains("://") { s = "https://" + s }
+        guard let url = URL(string: s), let host = url.host?.lowercased(),
+              host.hasSuffix("youtube.com") || host.hasSuffix("youtu.be") else { return nil }
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        var video = query.first { $0.name == "v" }?.value
+        let list = query.first { $0.name == "list" }?.value
+        let path = url.pathComponents
+        if host.hasSuffix("youtu.be"), path.count > 1 { video = path[1] }
+        if let i = path.firstIndex(where: { ["shorts", "live", "embed"].contains($0) }), i + 1 < path.count {
+            video = path[i + 1]
+        }
+        guard video != nil || list != nil else { return nil }
+        return Parsed(videoID: video, listID: list)
+    }
+
+    static func videoURL(_ id: String) -> String { "https://www.youtube.com/watch?v=\(id)" }
+    static func playlistURL(_ id: String) -> String { "https://www.youtube.com/playlist?list=\(id)" }
+}
+
+enum SegmentBuilder {
+    static func make(_ meta: TrackMeta, start: Double, end: Double, artwork: String?, split: Bool) -> Segment {
+        Segment(start: start, end: end, title: meta.title, artist: meta.artist, album: meta.album,
+                albumArtist: meta.albumArtist, trackNumber: meta.trackNumber, trackCount: meta.trackCount,
+                year: meta.year, genre: meta.genre,
+                fadeIn: split ? Prefs.fadeInSplit : Prefs.fadeInSingle,
+                fadeOut: split ? Prefs.fadeOutSplit : Prefs.fadeOutSingle,
+                artworkFile: artwork, metadataSource: meta.source)
+    }
+
+    /// Album-level info for a multi-song video (concert, full album).
+    static func albumMeta(_ info: VideoInfo) async -> TrackMeta {
+        let artist = MetadataResolver.videoArtist(info)
+        var meta = TrackMeta(title: "", artist: artist, source: "Video title")
+        if let name = MetadataResolver.albumName(info) {
+            meta.album = name
+            if let c = await MetadataResolver.searchAlbum(name, artist: artist) {
+                meta.album = c.cleanCollectionName
+                meta.albumArtist = c.artistName ?? artist
+                if let d = c.releaseDate, d.count >= 4 { meta.year = String(d.prefix(4)) }
+                meta.genre = c.primaryGenreName ?? ""
+                meta.artworkURL = c.artworkURL
+                meta.source = "Apple Music catalog"
+            }
+        }
+        MetadataResolver.finalize(&meta)
+        return meta
+    }
+
+    static func fromChapters(_ chapters: [Chapter], album: TrackMeta, artwork: String?) -> [Segment] {
+        let realAlbum = album.album != Prefs.fallbackAlbum
+        var segments = chapters.map { ch -> Segment in
+            let parsed = MetadataResolver.chapterTrack(ch.title, videoArtist: album.artist)
+            var meta = album
+            meta.title = parsed.title
+            meta.artist = parsed.artist
+            var seg = make(meta, start: ch.start, end: ch.end, artwork: artwork, split: true)
+            seg.included = !parsed.skip
+            return seg
+        }
+        if realAlbum { number(&segments) }
+        return segments
+    }
+
+    static func fromRanges(_ ranges: [ClosedRange<Double>], names: [String], template: Segment) -> [Segment] {
+        var segments = ranges.enumerated().map { i, r -> Segment in
+            var seg = template
+            seg.id = UUID()
+            seg.start = r.lowerBound
+            seg.end = r.upperBound
+            seg.title = i < names.count ? names[i] : "Track \(i + 1)"
+            seg.fadeIn = ranges.count > 1 ? Prefs.fadeInSplit : Prefs.fadeInSingle
+            seg.fadeOut = ranges.count > 1 ? Prefs.fadeOutSplit : Prefs.fadeOutSingle
+            seg.included = true
+            seg.musicPersistentID = nil
+            seg.addedToMusicAt = nil
+            return seg
+        }
+        if template.album != Prefs.fallbackAlbum && ranges.count > 1 { number(&segments) }
+        return segments
+    }
+
+    static func number(_ segments: inout [Segment]) {
+        let count = segments.filter(\.included).count
+        var n = 0
+        for i in segments.indices where segments[i].included {
+            n += 1
+            segments[i].trackNumber = n
+            segments[i].trackCount = count
+        }
+    }
+}
+
+enum Notifier {
+    private static var available: Bool { Bundle.main.bundleIdentifier != nil }
+
+    static func requestAuthorization() {
+        guard available else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    static func post(_ title: String, _ body: String) {
+        guard available else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString,
+                                                                     content: content, trigger: nil))
+    }
+}
+
+/// Runs the download queue and the playlist monitor.
+@MainActor @Observable
+final class Engine {
+    static let shared = Engine()
+
+    var active: Set<UUID> = []
+    var syncing: Set<UUID> = []
+    var lastSync: Date?
+
+    @ObservationIgnored private let lib = Library.shared
+    @ObservationIgnored private var started = false
+    @ObservationIgnored private var monitor: Task<Void, Never>?
+    @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
+    private let maxConcurrent = 2
+
+    func start() {
+        guard !started else { return }
+        started = true
+        for item in lib.items {
+            switch item.status {
+            case .downloading, .processing:
+                lib.update(item.id) { $0.status = .queued }
+            case .exporting:
+                lib.update(item.id) { $0.status = .needsReview }
+            default: break
+            }
+        }
+        Notifier.requestAuthorization()
+        pump()
+        monitor = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.syncAllPlaylists()
+                let minutes = max(5, Prefs.checkIntervalMinutes)
+                try? await Task.sleep(for: .seconds(minutes * 60))
+            }
+        }
+    }
+
+    // MARK: - Queue
+
+    @discardableResult
+    func addVideo(id videoID: String, title: String = "", playlist: UUID? = nil, autoAdd: Bool) -> UUID {
+        let item = DownloadItem(videoID: videoID, url: LinkParser.videoURL(videoID), title: title,
+                                playlistID: playlist, autoAdd: autoAdd)
+        lib.items.append(item)
+        lib.save()
+        pump()
+        return item.id
+    }
+
+    func retry(_ id: UUID) {
+        lib.update(id) {
+            $0.status = $0.sourceFile == nil || $0.segments.isEmpty ? .queued : .needsReview
+            $0.errorMessage = nil
+        }
+        pump()
+    }
+
+    func cancel(_ id: UUID) {
+        tasks[id]?.cancel()
+    }
+
+    func remove(_ id: UUID) {
+        tasks[id]?.cancel()
+        lib.removeItem(id)
+    }
+
+    private func pump() {
+        while active.count < maxConcurrent,
+              let next = lib.items.first(where: { $0.status == .queued && !active.contains($0.id) }) {
+            let id = next.id
+            active.insert(id)
+            tasks[id] = Task { [weak self] in
+                await self?.process(id)
+                self?.active.remove(id)
+                self?.tasks[id] = nil
+                self?.lib.progress[id] = nil
+                self?.pump()
+            }
+        }
+    }
+
+    private func process(_ id: UUID) async {
+        guard let item = lib.item(id) else { return }
+        let dir = lib.folder(for: id)
+        do {
+            lib.update(id) { $0.status = .downloading; $0.errorMessage = nil }
+            let (info, source) = try await YTDLP.downloadAudio(item.url, into: dir) { p in
+                Task { @MainActor in Library.shared.progress[id] = p }
+            }
+            lib.progress[id] = nil
+            let hasThumb = FileManager.default.fileExists(atPath: dir.appendingPathComponent("thumb.jpg").path)
+            let setlist = MetadataResolver.setlist(from: info.description)
+            lib.update(id) {
+                $0.status = .processing
+                $0.title = info.title
+                $0.channel = info.channel
+                $0.duration = info.duration
+                $0.chapters = info.chapters
+                $0.setlist = setlist
+                $0.sourceFile = source.lastPathComponent
+                $0.thumbnailFile = hasThumb ? "thumb.jpg" : nil
+                $0.sourceCodec = info.acodec
+                $0.sourceBitrate = info.abr
+            }
+
+            try await AudioTools.makePreview(source: source, dest: dir.appendingPathComponent("preview.m4a"))
+            lib.update(id) { $0.previewFile = "preview.m4a" }
+
+            var thumbArt: String?
+            if hasThumb, (try? ImageTools.writeSquare(from: dir.appendingPathComponent("thumb.jpg"),
+                                                      to: dir.appendingPathComponent("art-thumb.jpg"))) != nil {
+                thumbArt = "art-thumb.jpg"
+            }
+
+            let segments = try await buildSegments(info: info, source: source, dir: dir,
+                                                   setlist: setlist, thumbArt: thumbArt)
+            lib.update(id) { $0.segments = segments; $0.status = .needsReview }
+
+            if item.autoAdd { await exportAndAdd(id) }
+        } catch is CancellationError {
+            lib.update(id) { $0.status = .failed; $0.errorMessage = "Cancelled" }
+        } catch {
+            lib.update(id) { $0.status = .failed; $0.errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func buildSegments(info: VideoInfo, source: URL, dir: URL, setlist: [String],
+                               thumbArt: String?) async throws -> [Segment] {
+        let chapters = info.chapters
+        let duration = info.duration > 0 ? info.duration : (chapters.last?.end ?? 0)
+        let splitChapters = Prefs.autoSplitChapters && chapters.count >= max(2, Prefs.minChaptersToSplit)
+        let splitSetlist = Prefs.autoSplitChapters && !splitChapters && setlist.count >= 2
+            && duration >= Double(setlist.count) * 60
+
+        guard splitChapters || splitSetlist else {
+            let meta = await MetadataResolver.resolveSingle(info)
+            let art = await downloadArtwork(meta.artworkURL, dir: dir) ?? thumbArt
+            return [SegmentBuilder.make(meta, start: 0, end: duration, artwork: art, split: false)]
+        }
+
+        let album = await SegmentBuilder.albumMeta(info)
+        let art = await downloadArtwork(album.artworkURL, dir: dir) ?? thumbArt
+        if splitChapters {
+            return SegmentBuilder.fromChapters(chapters, album: album, artwork: art)
+        }
+        let env = try await AudioTools.envelope(source: source, cache: dir.appendingPathComponent("envelope.bin"))
+        let ranges = SplitDetector.byCount(env, count: setlist.count, minSong: Prefs.minSong)
+        var template = SegmentBuilder.make(album, start: 0, end: 0, artwork: art, split: true)
+        template.metadataSource = "Description set list"
+        return SegmentBuilder.fromRanges(ranges, names: setlist, template: template)
+    }
+
+    func downloadArtwork(_ url: URL?, dir: URL) async -> String? {
+        guard let url, let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty else { return nil }
+        let name = "art-\(UUID().uuidString.prefix(8)).jpg"
+        do {
+            try data.write(to: dir.appendingPathComponent(name))
+            return name
+        } catch { return nil }
+    }
+
+    // MARK: - Music
+
+    /// Exports every included track and adds it to Music, replacing earlier versions.
+    func exportAndAdd(_ id: UUID) async {
+        guard let item = lib.item(id), let sourceName = item.sourceFile else { return }
+        let dir = lib.folder(for: id)
+        let outDir = lib.exportFolder(for: id)
+        lib.update(id) { $0.status = .exporting; $0.errorMessage = nil }
+        var addedTitles: [String] = []
+        do {
+            for seg in item.segments {
+                guard seg.included else {
+                    // Unchecked after being added: take it back out of Music.
+                    if let pid = seg.musicPersistentID {
+                        await MusicApp.delete(persistentID: pid)
+                        updateSegment(id, seg.id) { $0.musicPersistentID = nil; $0.addedToMusicAt = nil }
+                    }
+                    continue
+                }
+                let base = "\(seg.artist) - \(seg.title)".components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>"))
+                    .joined(separator: "_")
+                let dest = outDir.appendingPathComponent("\(String(base.prefix(120))).\(AudioTools.outputExtension)")
+                try await AudioTools.export(seg, source: dir.appendingPathComponent(sourceName),
+                                            artwork: seg.artworkFile.map { dir.appendingPathComponent($0) },
+                                            sourceURL: item.url, dest: dest)
+                if let old = seg.musicPersistentID { await MusicApp.delete(persistentID: old) }
+                let added = try await MusicApp.add(dest)
+                if let location = added.location, location != dest.path {
+                    try? FileManager.default.removeItem(at: dest)   // Music made its own copy
+                }
+                updateSegment(id, seg.id) {
+                    $0.musicPersistentID = added.persistentID
+                    $0.addedToMusicAt = Date()
+                }
+                addedTitles.append(seg.title)
+            }
+            lib.update(id) { $0.status = .added; $0.completed = Date() }
+            if item.autoAdd, !addedTitles.isEmpty {
+                Notifier.post("Added to Music", addedTitles.count == 1
+                              ? "\(addedTitles[0]) — \(item.segments.first?.artist ?? "")"
+                              : "\(addedTitles.count) tracks from \(item.title)")
+            }
+        } catch {
+            lib.update(id) { $0.status = .needsReview; $0.errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func updateSegment(_ id: UUID, _ segID: UUID, _ change: (inout Segment) -> Void) {
+        lib.update(id) { item in
+            if let i = item.segments.firstIndex(where: { $0.id == segID }) { change(&item.segments[i]) }
+        }
+    }
+
+    // MARK: - Playlists
+
+    enum AddError: LocalizedError {
+        case alreadyMonitored(String)
+        var errorDescription: String? {
+            switch self { case .alreadyMonitored(let t): "“\(t)” is already being monitored." }
+        }
+    }
+
+    func addPlaylist(listID: String, downloadExisting: Bool, autoAdd: Bool) async throws {
+        let url = LinkParser.playlistURL(listID)
+        let listing = try await YTDLP.playlist(url)
+        if let existing = lib.playlists.first(where: { $0.youtubeID == listID }) {
+            throw AddError.alreadyMonitored(existing.title)
+        }
+        var playlist = Playlist(url: url, youtubeID: listID, title: listing.title, autoAddToMusic: autoAdd)
+        if !downloadExisting {
+            playlist.knownVideoIDs = Set(listing.entries.map(\.id))
+            playlist.lastChecked = Date()
+        }
+        lib.playlists.append(playlist)
+        lib.save()
+        if downloadExisting { apply(listing, to: playlist.id) }
+    }
+
+    func syncAllPlaylists() async {
+        for p in lib.playlists where p.enabled { await sync(p.id) }
+        lastSync = Date()
+    }
+
+    func sync(_ playlistID: UUID) async {
+        guard let p = lib.playlist(playlistID), !syncing.contains(playlistID) else { return }
+        syncing.insert(playlistID)
+        defer { syncing.remove(playlistID) }
+        do {
+            apply(try await YTDLP.playlist(p.url), to: playlistID)
+        } catch {
+            lib.updatePlaylist(playlistID) { $0.lastError = error.localizedDescription; $0.lastChecked = Date() }
+        }
+    }
+
+    private func apply(_ listing: PlaylistListing, to playlistID: UUID) {
+        guard let p = lib.playlist(playlistID) else { return }
+        var seen = p.knownVideoIDs
+        for entry in listing.entries where !seen.contains(entry.id) {
+            if ["[Private video]", "[Deleted video]"].contains(entry.title) { continue }
+            seen.insert(entry.id)
+            if lib.hasVideo(entry.id) { continue }
+            addVideo(id: entry.id, title: entry.title, playlist: playlistID, autoAdd: p.autoAddToMusic)
+        }
+        lib.updatePlaylist(playlistID) {
+            $0.knownVideoIDs = seen
+            $0.title = listing.title.isEmpty ? $0.title : listing.title
+            $0.lastChecked = Date()
+            $0.lastError = nil
+        }
+    }
+}
