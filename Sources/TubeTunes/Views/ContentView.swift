@@ -259,7 +259,8 @@ struct AddLinkSheet: View {
                     }
                     Toggle("Download songs already in the playlist", isOn: $downloadExisting)
                     Toggle("Add new songs straight to Music (otherwise they wait for review)", isOn: $autoAddPlaylist)
-                    Text("The playlist is checked every \(Int(Prefs.checkIntervalMinutes)) minutes while TubeTunes is running.")
+                    Text("The playlist is checked every \(Int(Prefs.checkIntervalMinutes)) minutes"
+                         + (Prefs.backgroundSync ? ", even when TubeTunes is closed." : " while TubeTunes is running."))
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Toggle("Review before adding to Music (trim, split, artwork)", isOn: $reviewVideo)

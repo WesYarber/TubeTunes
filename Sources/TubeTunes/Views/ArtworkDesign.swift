@@ -304,6 +304,17 @@ enum ArtworkStyles {
     /// Scale at which the whole image fits inside the square.
     static func containScale(aspect: Double) -> Double { aspect >= 1 ? 1 / aspect : aspect }
 
+    /// Scale and vertical offset that place the image near the top, leaving at least `textRoom`
+    /// (a fraction of the height) free at the bottom for text — whatever the image's shape.
+    static func topAligned(aspect: Double, maxScale: Double, textRoom: Double, margin: Double)
+        -> (scale: Double, offsetY: Double) {
+        let heightPerScale = aspect >= 1 ? 1.0 : 1 / aspect      // image height ÷ side, at scale 1
+        let widthPerScale = aspect >= 1 ? aspect : 1.0
+        let scale = min(maxScale, (1 - textRoom - margin) / heightPerScale, 1 / widthPerScale)
+        let height = scale * heightPerScale
+        return (scale, -(1 - height) / 2 + margin)
+    }
+
     /// Tasteful starting points generated from the image's own colors.
     static func all(palette p: Palette, aspect: Double) -> [ArtworkStyle] {
         let contain = containScale(aspect: aspect)
@@ -326,12 +337,14 @@ enum ArtworkStyles {
                 d.band = .shade; d.bandColor = .black; d.centered = false; d.textSize = 0.085
             },
             ArtworkStyle(name: "Poster") { d in
-                reset(&d); d.scale = contain; d.offsetY = -0.13; d.background = .solid; d.bg1 = p.dark
+                let fit = topAligned(aspect: aspect, maxScale: contain, textRoom: 0.28, margin: 0.08)
+                reset(&d); d.scale = fit.scale; d.offsetY = fit.offsetY; d.background = .solid; d.bg1 = p.dark
                 d.showText = true; d.font = .futura; d.uppercase = true; d.textColor = p.light
                 d.band = .none; d.textSize = 0.07
             },
             ArtworkStyle(name: "Polaroid") { d in
-                reset(&d); d.scale = contain * 0.88; d.offsetY = -0.09; d.background = .solid; d.bg1 = .paper
+                let fit = topAligned(aspect: aspect, maxScale: contain * 0.88, textRoom: 0.24, margin: 0.06)
+                reset(&d); d.scale = fit.scale; d.offsetY = fit.offsetY; d.background = .solid; d.bg1 = .paper
                 d.showText = true; d.font = .marker; d.textColor = .ink; d.band = .none; d.textSize = 0.07
             },
             ArtworkStyle(name: "Gallery") { d in
