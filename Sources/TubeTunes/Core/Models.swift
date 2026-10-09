@@ -76,6 +76,8 @@ struct DownloadItem: Codable, Identifiable, Hashable {
     var segments: [Segment] = []
     /// Music tracks this download has added and that should still exist (cleaned up on the next export).
     var musicTrackIDs: [String]?
+    /// The tracks as they were last sent to Music, to tell whether later edits still need an update.
+    var exportedSegments: [Segment]?
     var created = Date()
     var completed: Date?
 

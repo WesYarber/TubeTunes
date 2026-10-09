@@ -168,6 +168,9 @@ final class Engine {
     /// Cleans up after an interrupted run and removed downloads.
     private func prepare() {
         lib.purgeRemovedFiles()
+        for item in lib.items where item.status == .added && item.exportedSegments == nil {
+            lib.update(item.id) { $0.exportedSegments = $0.segments }
+        }
         for item in lib.items {
             switch item.status {
             case .downloading, .processing:
@@ -399,6 +402,7 @@ final class Engine {
                 $0.status = .added
                 $0.completed = Date()
                 $0.musicTrackIDs = added
+                $0.exportedSegments = $0.segments
             }
             if item.autoAdd, !addedTitles.isEmpty {
                 await Notifier.post("Added to Music", addedTitles.count == 1

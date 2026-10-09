@@ -1,43 +1,30 @@
 import SwiftUI
 
-enum SidebarItem: Hashable {
-    case queue, history, playlists
-}
-
+/// The single main window: a list of every download that turns into the editor when you open one.
 struct ContentView: View {
     @Environment(Library.self) private var lib
     @Environment(Engine.self) private var engine
-    @State private var selection: SidebarItem? = .queue
+    @State private var path: [UUID] = []
     @State private var showAdd = false
     @State private var missingTools: [String] = []
 
     var body: some View {
-        NavigationSplitView {
-            List(selection: $selection) {
-                Label("Queue", systemImage: "tray.and.arrow.down")
-                    .badge(lib.items.filter { $0.status != .added }.count)
-                    .tag(SidebarItem.queue)
-                Label("History", systemImage: "clock.arrow.circlepath")
-                    .tag(SidebarItem.history)
-                Label("Playlists", systemImage: "music.note.list")
-                    .badge(lib.playlists.count)
-                    .tag(SidebarItem.playlists)
-            }
-            .navigationSplitViewColumnWidth(min: 170, ideal: 190)
-        } detail: {
-            switch selection ?? .queue {
-            case .queue: QueueView()
-            case .history: HistoryView()
-            case .playlists: PlaylistsView()
-            }
+        NavigationStack(path: $path) {
+            LibraryView(showAdd: $showAdd) { path.append($0) }
+                .navigationDestination(for: UUID.self) { id in
+                    EditorView(itemID: id) { if !path.isEmpty { path.removeLast() } }
+                        .navigationBarBackButtonHidden(true)
+                }
         }
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button { showAdd = true } label: { Label("Add Link", systemImage: "plus") }
-                    .keyboardShortcut("n")
-            }
-        }
+        .frame(minWidth: 960, minHeight: 700)
         .sheet(isPresented: $showAdd) { AddLinkSheet() }
+        .safeAreaInset(edge: .top) {
+            if !missingTools.isEmpty {
+                Text("Missing tools: \(missingTools.joined(separator: ", ")). Install with: brew install yt-dlp ffmpeg")
+                    .font(.callout).padding(8).frame(maxWidth: .infinity)
+                    .background(.red.opacity(0.15))
+            }
+        }
         .overlay {
             if engine.waitingForBackgroundSync {
                 ZStack {
@@ -46,85 +33,145 @@ struct ContentView: View {
                 }
             }
         }
-        .safeAreaInset(edge: .top) {
-            if !missingTools.isEmpty {
-                Text("Missing tools: \(missingTools.joined(separator: ", ")). Install with: brew install yt-dlp ffmpeg")
-                    .font(.callout).padding(8).frame(maxWidth: .infinity)
-                    .background(.red.opacity(0.15))
-            }
-        }
         .onAppear {
             missingTools = ["yt-dlp", "ffmpeg"].filter { Tools.path($0) == nil }
         }
     }
 }
 
-// MARK: - Queue
+// MARK: - Library list
 
-struct QueueView: View {
+struct LibraryView: View {
+    @Binding var showAdd: Bool
+    var open: (UUID) -> Void
     @Environment(Library.self) private var lib
     @Environment(Engine.self) private var engine
     @Environment(\.undoManager) private var undoManager
-    @Environment(\.openWindow) private var openWindow
+    @State private var search = ""
+    @State private var filter: Filter = .all
 
-    private var items: [DownloadItem] {
-        lib.items.filter { $0.status != .added }.sorted { $0.created > $1.created }
+    enum Filter: String, CaseIterable {
+        case all = "All", review = "To Review", inMusic = "In Music", active = "In Progress"
+    }
+
+    private func matches(_ item: DownloadItem) -> Bool {
+        switch filter {
+        case .all: break
+        case .review: guard item.status == .needsReview || item.status == .failed else { return false }
+        case .inMusic: guard item.status == .added else { return false }
+        case .active: guard item.status.isBusy else { return false }
+        }
+        guard !search.isEmpty else { return true }
+        let fields = [item.title, item.channel] + item.segments.flatMap { [$0.title, $0.artist, $0.album] }
+        return fields.contains { $0.localizedCaseInsensitiveContains(search) }
+    }
+
+    private var attention: [DownloadItem] {
+        lib.items.filter { $0.status != .added && matches($0) }.sorted { $0.created > $1.created }
+    }
+
+    private var inMusic: [DownloadItem] {
+        lib.items.filter { $0.status == .added && matches($0) }
+            .sorted { ($0.completed ?? $0.created) > ($1.completed ?? $1.created) }
     }
 
     var body: some View {
         Group {
-            if items.isEmpty {
-                ContentUnavailableView("Nothing in the queue", systemImage: "tray",
-                                       description: Text("Add a YouTube video or playlist link with the + button."))
+            if lib.items.isEmpty {
+                ContentUnavailableView {
+                    Label("Nothing downloaded yet", systemImage: "music.note.tv")
+                } description: {
+                    Text("Add a YouTube video or playlist link to get started.")
+                } actions: {
+                    Button("Add Link…") { showAdd = true }
+                }
+            } else if attention.isEmpty && inMusic.isEmpty {
+                ContentUnavailableView.search(text: search)
             } else {
-                List(items) { item in
-                    QueueRow(item: item)
-                        .contextMenu { contextMenu(item) }
+                List {
+                    if !attention.isEmpty {
+                        Section("Needs Attention") {
+                            ForEach(attention) { row($0) }
+                        }
+                    }
+                    if !inMusic.isEmpty {
+                        Section("In Music") {
+                            ForEach(inMusic) { row($0) }
+                        }
+                    }
                 }
             }
         }
-        .navigationTitle("Queue")
+        .navigationTitle("TubeTunes")
+        .searchable(text: $search, prompt: "Search songs, artists, videos")
         .toolbar {
-            ToolbarItem {
-                Button("Add All Reviewed") {
-                    Task {
-                        for item in items where item.status == .needsReview { await engine.exportAndAdd(item.id) }
-                    }
+            ToolbarItem(placement: .navigation) {
+                Picker("Show", selection: $filter) {
+                    ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
-                .disabled(!items.contains { $0.status == .needsReview })
-                .help("Add every track that's ready for review to Music as-is")
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { Task { await engine.syncAllPlaylists() } } label: {
+                    Label("Check Playlists", systemImage: "arrow.clockwise")
+                }
+                .help("Check monitored playlists for new videos now")
+                .disabled(!engine.syncing.isEmpty || lib.playlists.isEmpty)
+                Button { showAdd = true } label: { Label("Add Link", systemImage: "plus") }
+                    .keyboardShortcut("n")
+                    .help("Add a video or playlist link (⌘N)")
+                SettingsLink { Label("Settings", systemImage: "gearshape") }
+                    .help("Settings and monitored playlists (⌘,)")
             }
         }
     }
 
-    @ViewBuilder private func contextMenu(_ item: DownloadItem) -> some View {
-        Button("Edit…") { openWindow(id: "editor", value: item.id) }.disabled(item.segments.isEmpty)
-        Button("Open on YouTube") { NSWorkspace.shared.open(URL(string: item.url)!) }
-        if item.status == .failed { Button("Retry") { engine.retry(item.id) } }
-        if item.status.isBusy { Button("Cancel") { engine.cancel(item.id) } }
-        Divider()
-        Button("Remove", role: .destructive) { engine.remove(item.id, undoManager: undoManager) }
+    private func row(_ item: DownloadItem) -> some View {
+        LibraryRow(item: item, open: { open(item.id) })
+            .contentShape(Rectangle())
+            .onTapGesture { if !item.segments.isEmpty { open(item.id) } }
+            .contextMenu {
+                Button("Edit…") { open(item.id) }.disabled(item.segments.isEmpty)
+                if let pid = item.segments.first(where: { $0.musicPersistentID != nil })?.musicPersistentID {
+                    Button("Show in Music") { Task { try? await MusicApp.reveal(persistentID: pid) } }
+                }
+                Button("Open on YouTube") { NSWorkspace.shared.open(URL(string: item.url)!) }
+                if item.status == .failed { Button("Retry") { engine.retry(item.id) } }
+                if item.status.isBusy { Button("Cancel") { engine.cancel(item.id) } }
+                Divider()
+                Button("Remove from TubeTunes", role: .destructive) { engine.remove(item.id, undoManager: undoManager) }
+            }
     }
 }
 
-struct QueueRow: View {
+struct LibraryRow: View {
     let item: DownloadItem
+    var open: () -> Void
     @Environment(Library.self) private var lib
     @Environment(Engine.self) private var engine
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         HStack(spacing: 12) {
             VideoThumb(item: item)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(item.title.isEmpty ? item.url : item.title).font(.headline).lineLimit(1)
+            if let art = lib.file(item, item.segments.first?.artworkFile) {
+                ArtworkImage(url: art, size: 54)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(primaryTitle).font(.headline).lineLimit(1)
+                Text(secondary).foregroundStyle(.secondary).lineLimit(1)
                 HStack(spacing: 6) {
-                    StatusBadge(status: item.status)
-                    if !item.channel.isEmpty { Text(item.channel).foregroundStyle(.secondary) }
-                    if item.segments.count > 1 { Text("· \(item.includedSegments.count) tracks").foregroundStyle(.secondary) }
-                    if let p = lib.playlist(item.playlistID) { Text("· \(p.title)").foregroundStyle(.secondary) }
+                    if item.status != .added { StatusBadge(status: item.status) }
+                    if let p = lib.playlist(item.playlistID) {
+                        Label(p.title, systemImage: "music.note.list")
+                    } else {
+                        Label("Single link", systemImage: "link")
+                    }
+                    if let date = item.completed ?? Optional(item.created) {
+                        Text(date, format: .dateTime.month().day().hour().minute())
+                    }
                 }
-                .font(.caption)
+                .font(.caption).foregroundStyle(.tertiary)
                 if let progress = lib.progress[item.id], item.status == .downloading {
                     ProgressView(value: progress).frame(maxWidth: 260)
                 } else if item.status.isBusy && item.status != .queued {
@@ -137,176 +184,34 @@ struct QueueRow: View {
             Spacer()
             switch item.status {
             case .needsReview:
-                Button("Edit…") { openWindow(id: "editor", value: item.id) }
                 Button((item.musicTrackIDs ?? []).isEmpty ? "Add to Music" : "Update in Music") {
                     Task { await engine.exportAndAdd(item.id) }
                 }
-                    .buttonStyle(.borderedProminent)
+                .buttonStyle(.borderedProminent)
             case .failed:
                 Button("Retry") { engine.retry(item.id) }
             default:
                 EmptyView()
             }
+            if !item.segments.isEmpty {
+                Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+            }
         }
         .padding(.vertical, 4)
     }
-}
 
-// MARK: - History
-
-struct HistoryView: View {
-    @Environment(Library.self) private var lib
-    @Environment(\.openWindow) private var openWindow
-    @State private var search = ""
-    @State private var error: String?
-
-    private struct Entry: Identifiable {
-        let item: DownloadItem
-        let segment: Segment
-        var id: UUID { segment.id }
+    /// Single songs show the song; multi-song videos show the video title.
+    private var primaryTitle: String {
+        if item.segments.count == 1, let s = item.segments.first, !s.title.isEmpty { return s.title }
+        return item.title.isEmpty ? item.url : item.title
     }
 
-    private var entries: [Entry] {
-        let all = lib.items.flatMap { item in
-            item.segments.filter { $0.musicPersistentID != nil }.map { Entry(item: item, segment: $0) }
-        }
-        let filtered = search.isEmpty ? all : all.filter {
-            [$0.segment.title, $0.segment.artist, $0.segment.album, $0.item.title]
-                .contains { $0.localizedCaseInsensitiveContains(search) }
-        }
-        return filtered.sorted { ($0.segment.addedToMusicAt ?? .distantPast) > ($1.segment.addedToMusicAt ?? .distantPast) }
-    }
-
-    var body: some View {
-        Group {
-            if entries.isEmpty {
-                ContentUnavailableView(search.isEmpty ? "No tracks yet" : "No matches", systemImage: "music.note",
-                                       description: Text(search.isEmpty ? "Tracks you add to Music show up here." : ""))
-            } else {
-                List(entries) { entry in
-                    HStack(spacing: 12) {
-                        VideoThumb(item: entry.item)
-                        ArtworkImage(url: lib.file(entry.item, entry.segment.artworkFile), size: 44)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(entry.segment.title).font(.headline).lineLimit(1)
-                            Text("\(entry.segment.artist) — \(entry.segment.album)")
-                                .foregroundStyle(.secondary).lineLimit(1)
-                            HStack(spacing: 4) {
-                                if let p = lib.playlist(entry.item.playlistID) {
-                                    Image(systemName: "music.note.list"); Text(p.title)
-                                } else {
-                                    Image(systemName: "link"); Text("Single link")
-                                }
-                                Text("· \(formatTime(entry.segment.duration))")
-                            }
-                            .font(.caption).foregroundStyle(.tertiary)
-                        }
-                        Spacer()
-                        if let date = entry.segment.addedToMusicAt {
-                            Text(date, format: .dateTime.month().day().year().hour().minute())
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Button("Edit…") { openWindow(id: "editor", value: entry.item.id) }
-                            .help("Re-trim, re-split or change tags/artwork, then update the track in Music")
-                    }
-                    .padding(.vertical, 3)
-                    .contextMenu {
-                        Button("Edit & Update in Music…") { openWindow(id: "editor", value: entry.item.id) }
-                        Button("Show in Music") {
-                            Task {
-                                do { try await MusicApp.reveal(persistentID: entry.segment.musicPersistentID ?? "") }
-                                catch { self.error = error.localizedDescription }
-                            }
-                        }
-                        Button("Open on YouTube") { NSWorkspace.shared.open(URL(string: entry.item.url)!) }
-                    }
-                    .onTapGesture(count: 2) { openWindow(id: "editor", value: entry.item.id) }
-                }
-            }
-        }
-        .navigationTitle("History")
-        .searchable(text: $search, prompt: "Search tracks")
-        .alert("Music", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
-            Button("OK") {}
-        } message: { Text(error ?? "") }
-    }
-}
-
-// MARK: - Playlists
-
-struct PlaylistsView: View {
-    @Environment(Library.self) private var lib
-    @Environment(Engine.self) private var engine
-    @Environment(\.undoManager) private var undoManager
-    @State private var confirmRemove: Playlist?
-
-    var body: some View {
-        Group {
-            if lib.playlists.isEmpty {
-                ContentUnavailableView("No playlists monitored", systemImage: "music.note.list",
-                                       description: Text("Add a playlist link and new videos will download automatically."))
-            } else {
-                List(lib.playlists) { p in
-                    row(p)
-                }
-            }
-        }
-        .navigationTitle("Playlists")
-        .toolbar {
-            ToolbarItem {
-                Button { Task { await engine.syncAllPlaylists() } } label: {
-                    Label("Check Now", systemImage: "arrow.clockwise")
-                }
-                .disabled(!engine.syncing.isEmpty)
-            }
-        }
-        .confirmationDialog("Stop monitoring “\(confirmRemove?.title ?? "")”?",
-                            isPresented: Binding(get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } })) {
-            Button("Stop Monitoring", role: .destructive) {
-                if let p = confirmRemove { lib.removePlaylist(p.id, undoManager: undoManager) }
-            }
-        } message: {
-            Text("Tracks already added to Music stay there. You can undo this with ⌘Z.")
-        }
-    }
-
-    private func row(_ p: Playlist) -> some View {
-        let downloaded = lib.items.filter { $0.playlistID == p.id }.count
-        return HStack(spacing: 12) {
-            Image(systemName: "music.note.list").font(.title2).foregroundStyle(.tint).frame(width: 32)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(p.title).font(.headline)
-                Text("\(downloaded) downloaded · \(p.knownVideoIDs.count) seen")
-                    .font(.caption).foregroundStyle(.secondary)
-                Group {
-                    if engine.syncing.contains(p.id) {
-                        Text("Checking…")
-                    } else if let checked = p.lastChecked {
-                        Text("Last checked ") + Text(checked, style: .relative) + Text(" ago")
-                    }
-                }
-                .font(.caption).foregroundStyle(.tertiary)
-                if let error = p.lastError {
-                    Text(error).font(.caption).foregroundStyle(.red).lineLimit(2)
-                }
-            }
-            Spacer()
-            Toggle("Auto-add to Music", isOn: Binding(
-                get: { p.autoAddToMusic },
-                set: { v in lib.setPlaylist(p.id, \.autoAddToMusic, v, actionName: "Change Auto-Add", undoManager: undoManager) }))
-                .help("Off: new songs wait in the Queue for review")
-            Toggle("Monitor", isOn: Binding(
-                get: { p.enabled },
-                set: { v in lib.setPlaylist(p.id, \.enabled, v, actionName: "Change Monitoring", undoManager: undoManager) }))
-            Menu {
-                Button("Check Now") { Task { await engine.sync(p.id) } }
-                Button("Open on YouTube") { NSWorkspace.shared.open(URL(string: p.url)!) }
-                Divider()
-                Button("Stop Monitoring…", role: .destructive) { confirmRemove = p }
-            } label: { Image(systemName: "ellipsis.circle") }
-            .menuStyle(.borderlessButton).fixedSize()
-        }
-        .padding(.vertical, 4)
+    private var secondary: String {
+        let included = item.includedSegments
+        guard let first = item.segments.first else { return item.channel }
+        if item.segments.count == 1 { return "\(first.artist) — \(first.album)" }
+        return "\(first.artist) — \(included.count) tracks: " + included.prefix(4).map(\.title).joined(separator: ", ")
+            + (included.count > 4 ? "…" : "")
     }
 }
 

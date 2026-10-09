@@ -1,30 +1,36 @@
 import AppKit
 import SwiftUI
 
-/// Undo/redo for one download's tracks. Each edit records the previous track list;
-/// rapid edits with the same name (dragging an edge, moving a slider) collapse into one step.
-///
-/// Music itself isn't touched by these edits — changes reach Music on "Update in Music" —
-/// so undo can always restore a previous state safely.
-@MainActor
-final class SegmentHistory {
+/// The editor's working copy of one download's tracks, with undo/redo. Nothing reaches the
+/// library until `save()`, and nothing reaches Music until "Add/Update in Music".
+/// Rapid edits with the same name (dragging an edge, moving a slider) collapse into one undo step.
+@MainActor @Observable
+final class EditorDraft {
     let itemID: UUID
-    weak var undoManager: UndoManager?
+    private(set) var segments: [Segment]
+    private var saved: [Segment]
 
-    private var lastName = ""
-    private var lastChange: Date?
-    private var lib: Library { .shared }
-    private var current: [Segment] { lib.item(itemID)?.segments ?? [] }
+    @ObservationIgnored weak var undoManager: UndoManager?
+    @ObservationIgnored private var lastName = ""
+    @ObservationIgnored private var lastChange: Date?
+    @ObservationIgnored private var lib: Library { .shared }
 
-    init(itemID: UUID) { self.itemID = itemID }
+    init(itemID: UUID) {
+        self.itemID = itemID
+        let segs = Library.shared.item(itemID)?.segments ?? []
+        segments = segs
+        saved = segs
+    }
+
+    var isDirty: Bool { segments != saved }
 
     func change(_ name: String, coalesce: Bool = false, _ body: (inout [Segment]) -> Void) {
-        let before = current
+        let before = segments
         var after = before
         body(&after)
         after.sort { $0.start < $1.start }
         guard after != before else { return }
-        write(after)
+        segments = after
 
         let now = Date()
         if coalesce, name == lastName, let last = lastChange, now.timeIntervalSince(last) < 1.0 {
@@ -34,6 +40,28 @@ final class SegmentHistory {
         register(restoring: before, name: name)
         lastName = coalesce ? name : ""
         lastChange = coalesce ? now : nil
+    }
+
+    /// Writes the draft to the library. A download already in Music goes back to "needs review"
+    /// so the list shows it has changes waiting for "Update in Music".
+    func save() {
+        let segs = segments
+        lib.update(itemID) { item in
+            if let exported = item.exportedSegments, [.added, .needsReview].contains(item.status) {
+                item.status = segs == exported ? .added : .needsReview
+            } else if item.segments != segs, item.status == .added {
+                item.status = .needsReview
+            }
+            item.segments = segs
+        }
+        saved = segs
+    }
+
+    /// Picks up changes made by an export (Music IDs, track numbers).
+    func reloadFromLibrary() {
+        let segs = lib.item(itemID)?.segments ?? segments
+        segments = segs
+        saved = segs
     }
 
     func detach() {
@@ -49,26 +77,18 @@ final class SegmentHistory {
     }
 
     private func restore(_ state: [Segment], name: String) {
-        let now = current
-        // Whether a track is in Music isn't undoable; keep the live IDs for tracks that still exist.
+        let now = segments
+        // Whether a track is in Music isn't undoable; keep the current IDs for tracks that still exist.
         let live = Dictionary(uniqueKeysWithValues: now.map { ($0.id, $0) })
-        let restored = state.map { seg -> Segment in
+        segments = state.map { seg -> Segment in
             guard let cur = live[seg.id] else { return seg }
             var s = seg
             s.musicPersistentID = cur.musicPersistentID
             s.addedToMusicAt = cur.addedToMusicAt
             return s
         }
-        write(restored)
         lastChange = nil
         register(restoring: now, name: name)   // registered during undo = redo
-    }
-
-    private func write(_ segments: [Segment]) {
-        lib.update(itemID) { item in
-            item.segments = segments
-            if item.status == .added { item.status = .needsReview }   // edits waiting for "Update in Music"
-        }
     }
 }
 

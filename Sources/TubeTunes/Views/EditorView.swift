@@ -3,13 +3,15 @@ import SwiftUI
 /// Review/edit window for one download: trim, split, fades, tags, artwork.
 struct EditorView: View {
     let itemID: UUID
+    /// Returns to the list.
+    var onClose: () -> Void
     @Environment(Library.self) private var lib
     @Environment(Engine.self) private var engine
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.undoManager) private var undoManager
 
     @State private var player = PreviewPlayer()
-    @State private var history: SegmentHistory
+    @State private var draft: EditorDraft
+    @State private var showLeavePrompt = false
     @State private var envelope: [Float] = []
     @State private var envelopeRange: ClosedRange<Float> = -60...0
     @State private var selection: UUID?
@@ -23,13 +25,14 @@ struct EditorView: View {
     @State private var message: String?
     @State private var lookingUp = false
 
-    init(itemID: UUID) {
+    init(itemID: UUID, onClose: @escaping () -> Void) {
         self.itemID = itemID
-        _history = State(initialValue: SegmentHistory(itemID: itemID))
+        self.onClose = onClose
+        _draft = State(initialValue: EditorDraft(itemID: itemID))
     }
 
     private var item: DownloadItem? { lib.item(itemID) }
-    private var segments: [Segment] { item?.segments ?? [] }
+    private var segments: [Segment] { draft.segments }
     private var selected: Segment? { segments.first { $0.id == selection } }
 
     var body: some View {
@@ -54,13 +57,21 @@ struct EditorView: View {
             .background(SpacebarCatcher { togglePlay() })
             .navigationTitle(item.title)
             .task(id: item.previewFile) { await load(item) }
-            .onAppear { history.undoManager = undoManager }
-            .onChange(of: undoManager) { _, um in history.undoManager = um }
+            .toolbar { toolbar(item, dirty: draft.isDirty) }
+            .confirmationDialog("Save your changes to “\(item.title)”?", isPresented: $showLeavePrompt) {
+                Button("Save") { draft.save(); leave() }
+                Button("Don't Save", role: .destructive) { leave() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Saved changes stay in TubeTunes until you click Update in Music.")
+            }
+            .onAppear { draft.undoManager = undoManager }
+            .onChange(of: undoManager) { _, um in draft.undoManager = um }
             .onChange(of: segments) { _, segs in player.applyFades(segs) }
             .onChange(of: player.currentTime) { _, t in follow(t) }
             .onDisappear {
                 player.stop()
-                history.detach()
+                draft.detach()
             }
             .sheet(isPresented: $showDetect) {
                 DetectSongsSheet(item: item, envelope: envelope) { ranges, names in
@@ -68,12 +79,14 @@ struct EditorView: View {
                 }
             }
             .sheet(item: Binding(get: { artworkFor.map(IdentifiedUUID.init) }, set: { artworkFor = $0?.id })) { target in
-                ArtworkEditor(itemID: itemID, segmentID: target.id) { file, all in
-                    history.change(all ? "Set Artwork for All Tracks" : "Set Artwork") { segs in
-                        for i in segs.indices where all || segs[i].id == target.id { segs[i].artworkFile = file }
+                if let seg = segments.first(where: { $0.id == target.id }) {
+                    ArtworkEditor(item: item, segment: seg, trackCount: segments.count) { file, all in
+                        draft.change(all ? "Set Artwork for All Tracks" : "Set Artwork") { segs in
+                            for i in segs.indices where all || segs[i].id == target.id { segs[i].artworkFile = file }
+                        }
                     }
+                    .environment(lib)
                 }
-                .environment(lib)
             }
             .alert("TubeTunes", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
                 Button("OK") {}
@@ -81,6 +94,33 @@ struct EditorView: View {
         } else {
             ContentUnavailableView("This download no longer exists", systemImage: "questionmark.folder")
         }
+    }
+
+    // MARK: - Toolbar & leaving
+
+    @ToolbarContentBuilder
+    private func toolbar(_ item: DownloadItem, dirty: Bool) -> some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button { goBack() } label: { Label("Back", systemImage: "chevron.left") }
+                .keyboardShortcut("[", modifiers: .command)
+                .help("Back to the list (⌘[)")
+        }
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button("Save") { draft.save() }
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!dirty)
+                .help("Save changes without updating Music (⌘S)")
+        }
+    }
+
+    private func goBack() {
+        if draft.isDirty { showLeavePrompt = true } else { leave() }
+    }
+
+    private func leave() {
+        player.stop()
+        draft.detach()
+        onClose()
     }
 
     // MARK: - Loading
@@ -257,12 +297,24 @@ struct EditorView: View {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").frame(width: 18)
             }
             .help("Play/Pause (Space)")
+            Button { previousTrack() } label: { Image(systemName: "backward.end.fill") }
+                .accessibilityLabel("Previous Track")
+                .help("Start of this track, or the previous track if already at its start")
+            Button { nextTrack() } label: { Image(systemName: "forward.end.fill") }
+                .accessibilityLabel("Next Track")
+                .help("Start of the next track")
+                .disabled(!segments.contains { $0.start > player.currentTime + 0.05 })
+            Button { endOfTrack() } label: { Image(systemName: "arrow.right.to.line") }
+                .accessibilityLabel("End of Track")
+                .help("End of this track")
+                .disabled(currentTrack == nil)
             Toggle(isOn: Binding(get: { followPlayhead }, set: { on in
                 followPlayhead = on
                 if on, !visibleRange.contains(player.currentTime) { setViewStart(player.currentTime - visibleSpan * 0.1) }
             })) {
-                Image(systemName: "arrow.right.to.line")
+                Image(systemName: "scope")
             }
+            .accessibilityLabel("Follow Playhead")
             .toggleStyle(.button)
             .help("Follow the playhead while playing. Scrolling turns this off; pressing play turns it back on.")
             Text("\(formatTime(player.currentTime, precise: true)) / \(formatTime(item.duration))")
@@ -284,7 +336,7 @@ struct EditorView: View {
                 }
                 Divider()
                 Button("Number Tracks 1…\(segments.filter(\.included).count)") {
-                    history.change("Number Tracks") { SegmentBuilder.number(&$0) }
+                    draft.change("Number Tracks") { SegmentBuilder.number(&$0) }
                 }
             } label: {
                 Label("Split", systemImage: "rectangle.split.3x1")
@@ -305,6 +357,44 @@ struct EditorView: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
+    }
+
+    // MARK: - Track navigation
+
+    /// The track under the playhead.
+    private var currentTrack: Segment? {
+        let t = player.currentTime
+        return segments.first { $0.start - 0.05 <= t && t < $0.end }
+    }
+
+    private func jump(to t: Double, select seg: Segment?) {
+        if let seg { selection = seg.id }
+        player.seek(t)
+        followPlayhead = true
+        if !visibleRange.contains(t) { setViewStart(t - visibleSpan * 0.1) }
+    }
+
+    /// Like a CD player: back to the start of this track, or to the previous track when already
+    /// within two seconds of the start.
+    private func previousTrack() {
+        let t = player.currentTime
+        if let cur = currentTrack, t - cur.start > 2 {
+            jump(to: cur.start, select: cur)
+        } else if let prev = segments.last(where: { $0.start < t - 0.05 && $0.id != currentTrack?.id }) {
+            jump(to: prev.start, select: prev)
+        } else if let first = segments.first {
+            jump(to: first.start, select: first)
+        }
+    }
+
+    private func nextTrack() {
+        guard let next = segments.first(where: { $0.start > player.currentTime + 0.05 }) else { return }
+        jump(to: next.start, select: next)
+    }
+
+    private func endOfTrack() {
+        guard let cur = currentTrack else { return }
+        jump(to: max(cur.start, cur.end - 0.05), select: cur)
     }
 
     // MARK: - Track list
@@ -353,7 +443,6 @@ struct EditorView: View {
                 onPlay: { from, to in play(from: from, until: to) },
                 onChooseArtwork: { artworkFor = seg.id },
                 onLookup: { lookup(seg) },
-                onApplyToAll: { applyToAll(from: seg) },
                 onMerge: { merge(seg.id) },
                 onDelete: { delete(seg.id) }
             )
@@ -370,6 +459,8 @@ struct EditorView: View {
             if let error = item.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red).lineLimit(2).font(.callout)
+            } else if draft.isDirty {
+                Label("Unsaved changes", systemImage: "pencil.circle").foregroundStyle(.orange)
             } else if alreadyAdded && item.status == .needsReview {
                 Label("Edited since it was added. Update to apply the changes in Music.", systemImage: "pencil.circle")
                     .foregroundStyle(.orange)
@@ -381,9 +472,11 @@ struct EditorView: View {
             if item.status == .exporting { ProgressView().controlSize(.small) }
             Button(alreadyAdded ? "Update in Music" : "Add to Music") {
                 player.pause()
+                draft.save()
                 Task {
                     await engine.exportAndAdd(itemID)
-                    if lib.item(itemID)?.status == .added { dismiss() }
+                    draft.reloadFromLibrary()
+                    if lib.item(itemID)?.status == .added { leave() }
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -398,9 +491,9 @@ struct EditorView: View {
 
     private func segmentBinding(_ id: UUID, name: String) -> Binding<Segment> {
         Binding(
-            get: { lib.item(itemID)?.segments.first { $0.id == id } ?? .placeholder },
+            get: { draft.segments.first { $0.id == id } ?? .placeholder },
             set: { new in
-                history.change(name, coalesce: true) { segs in
+                draft.change(name, coalesce: true) { segs in
                     if let i = segs.firstIndex(where: { $0.id == id }) { segs[i] = new }
                 }
             }
@@ -409,7 +502,7 @@ struct EditorView: View {
 
     private func moveEdge(_ id: UUID, _ edge: SegmentEdge, _ time: Double) {
         let duration = item?.duration ?? 0
-        history.change(edge == .start ? "Move Track Start" : "Move Track End", coalesce: true) { segs in
+        draft.change(edge == .start ? "Move Track Start" : "Move Track End", coalesce: true) { segs in
             guard let i = segs.firstIndex(where: { $0.id == id }) else { return }
             switch edge {
             case .start:
@@ -435,7 +528,7 @@ struct EditorView: View {
         second.fadeIn = Prefs.fadeInSplit
         second.musicPersistentID = nil
         second.addedToMusicAt = nil
-        history.change("Split Track") { segs in
+        draft.change("Split Track") { segs in
             guard let i = segs.firstIndex(where: { $0.id == seg.id }) else { return }
             segs[i].end = t
             segs[i].fadeOut = Prefs.fadeOutSplit
@@ -445,7 +538,7 @@ struct EditorView: View {
     }
 
     private func merge(_ id: UUID) {
-        history.change("Merge Tracks") { segs in
+        draft.change("Merge Tracks") { segs in
             guard let i = segs.firstIndex(where: { $0.id == id }), i + 1 < segs.count else { return }
             let next = segs.remove(at: i + 1)
             segs[i].end = next.end
@@ -455,7 +548,7 @@ struct EditorView: View {
 
     private func delete(_ id: UUID) {
         guard segments.count > 1 else { return }
-        history.change("Delete Track") { $0.removeAll { $0.id == id } }
+        draft.change("Delete Track") { $0.removeAll { $0.id == id } }
         if selection == id { selection = segments.first?.id }
     }
 
@@ -471,7 +564,7 @@ struct EditorView: View {
         var new = SegmentBuilder.fromChapters(item.chapters, album: album, artwork: template.artworkFile)
         if new.isEmpty { return }
         for i in new.indices { new[i].albumArtist = template.albumArtist }
-        history.change("Split by Chapters") { $0 = new }
+        draft.change("Split by Chapters") { $0 = new }
         selection = new.first?.id
     }
 
@@ -479,21 +572,8 @@ struct EditorView: View {
         guard !ranges.isEmpty else { return }
         let template = segments.first ?? .placeholder
         let new = SegmentBuilder.fromRanges(ranges, names: names, template: template)
-        history.change(actionName) { $0 = new }
+        draft.change(actionName) { $0 = new }
         selection = new.first?.id
-    }
-
-    private func applyToAll(from seg: Segment) {
-        history.change("Apply to All Tracks") { segs in
-            for i in segs.indices {
-                segs[i].artist = seg.artist
-                segs[i].album = seg.album
-                segs[i].albumArtist = seg.albumArtist
-                segs[i].year = seg.year
-                segs[i].genre = seg.genre
-                segs[i].artworkFile = seg.artworkFile
-            }
-        }
     }
 
     private func lookup(_ seg: Segment) {
@@ -509,7 +589,7 @@ struct EditorView: View {
             MetadataResolver.apply(c, to: &meta)
             MetadataResolver.finalize(&meta)
             let art = await engine.downloadArtwork(meta.artworkURL, dir: lib.folder(for: itemID))
-            history.change("Apple Music Lookup") { segs in
+            draft.change("Apple Music Lookup") { segs in
                 guard let i = segs.firstIndex(where: { $0.id == seg.id }) else { return }
                 segs[i].title = meta.title
                 segs[i].artist = meta.artist
@@ -542,7 +622,6 @@ struct SegmentDetail: View {
     var onPlay: (Double, Double?) -> Void
     var onChooseArtwork: () -> Void
     var onLookup: () -> Void
-    var onApplyToAll: () -> Void
     var onMerge: () -> Void
     var onDelete: () -> Void
 
@@ -582,9 +661,6 @@ struct SegmentDetail: View {
                     if !segment.metadataSource.isEmpty {
                         Text("From \(segment.metadataSource)").font(.caption).foregroundStyle(.secondary)
                     }
-                }
-                if trackCount > 1 {
-                    Button("Use This Artist, Album & Artwork for All Tracks", action: onApplyToAll)
                 }
             } header: { Text("Song") }
 

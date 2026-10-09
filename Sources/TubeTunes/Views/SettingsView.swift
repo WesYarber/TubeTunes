@@ -5,10 +5,11 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }
+            PlaylistsView().tabItem { Label("Playlists", systemImage: "music.note.list") }
             AudioSettings().tabItem { Label("Audio", systemImage: "waveform") }
             MetadataSettings().tabItem { Label("Metadata", systemImage: "tag") }
         }
-        .frame(width: 560)
+        .frame(width: 640, height: 560)
         .padding(.vertical, 8)
     }
 }

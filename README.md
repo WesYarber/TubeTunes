@@ -15,13 +15,22 @@ A macOS app that downloads audio from YouTube videos and playlists, tags it, and
   - "Detect Songs…" finds songs by silence, or by a known number of songs (quietest gaps, which works for live sets with applause).
   - Manual: split at the playhead, merge, delete, or drag the edges on the waveform.
 - **Trim and fades:** per track, previewed live in the editor. Defaults are set separately for single songs and split tracks.
-- **Waveform navigation:** pinch to zoom (centered under your fingers), swipe or scroll to pan, ⌥-scroll to zoom with a mouse, ⌘+ / ⌘− to step the zoom. The overview bar shows and drags the visible window. Space plays and pauses (except while typing). While playing, the view follows the playhead like Logic's Catch: scrolling away turns following off, and pressing play or the follow button turns it back on. ⌘B splits at the playhead.
+- **Waveform navigation:** pinch to zoom (centered under your fingers), swipe or scroll to pan, ⌥-scroll to zoom with a mouse, ⌘+ / ⌘− to step the zoom. The overview bar shows and drags the visible window. Space plays and pauses (except while typing). While playing, the view follows the playhead like Logic's Catch: scrolling away turns following off, and pressing play or the follow button turns it back on. ⌘B splits at the playhead. ⏮ goes to the start of the track, or the previous track when you're already near its start; ⏭ goes to the next track; →| goes to the end of the current track.
 - **Undo/redo (⌘Z / ⇧⌘Z):**
   - In the editor: every edit (splits, merges, deletes, detection, edge drags, trims, fades, tags, artwork, lookups).
   - In the main window: removing downloads, removing playlists, and the playlist toggles.
   - Editor changes reach Music only when you click **Update in Music**, so undo never loses a track.
-- **Artwork:** use the YouTube thumbnail, any frame from the video (downloads up to 1080p), Apple Music catalog art, or a file, then crop it square.
-- **History:** every track added to Music, with its YouTube thumbnail. **Edit…** re-exports a track and replaces it in Music.
+- **Artwork designer:**
+  - Use the YouTube thumbnail, any frame from the video (downloads up to 1080p), Apple Music catalog art, or a file.
+  - Drag or pinch to position the image. "Fit Whole Image" pads above and below so a full 16:9 thumbnail fits the square.
+  - Backgrounds: blurred image, solid color, or gradient. Borders: edge or inset frame. Filters: black & white, duotone, vintage.
+  - Text: title and subtitle, 12 fonts, size, color, position, band behind the text, all caps.
+  - A dozen styles (Poster, Polaroid, Headline, Duotone, and more) are generated from each image's own colors.
+  - Designs are saved next to the artwork, so they reopen exactly as you left them. By default the artwork applies to every track from the video.
+- **One window:**
+  - A single list of every download, split into "Needs Attention" and "In Music", with search, filters and YouTube thumbnails. Monitored playlists live in Settings › Playlists.
+  - Opening a download turns the window into the editor. ‹ Back returns to the list and offers Save / Don't Save if there are unsaved edits.
+  - Edits stay in TubeTunes until **Update in Music**, which replaces the tracks in Music.
 - **Background sync:**
   - A per-user launchd agent (`~/Library/LaunchAgents/net.wesyarber.TubeTunes.sync.plist`) wakes every 5 minutes at background priority, even when the app is quit.
   - It exits within milliseconds unless a playlist is due for its check interval or downloads are queued. It skips work in Low Power Mode.

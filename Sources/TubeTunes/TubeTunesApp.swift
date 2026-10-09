@@ -16,19 +16,12 @@ struct TubeTunesApp: App {
                 .environment(lib)
                 .environment(engine)
         }
-        .defaultSize(width: 980, height: 680)
-
-        WindowGroup("Edit", id: "editor", for: UUID.self) { $itemID in
-            if let itemID {
-                EditorView(itemID: itemID)
-                    .environment(lib)
-                    .environment(engine)
-            }
-        }
         .defaultSize(width: 1180, height: 820)
 
         Settings {
             SettingsView()
+                .environment(lib)
+                .environment(engine)
         }
 
         MenuBarExtra("TubeTunes", systemImage: "music.note.tv") {
