@@ -13,6 +13,7 @@
   <img alt="macOS 14+" src="https://img.shields.io/badge/macOS-14%2B-black?logo=apple">
   <img alt="Swift" src="https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white">
   <img alt="Powered by yt-dlp and ffmpeg" src="https://img.shields.io/badge/powered%20by-yt--dlp%20%2B%20ffmpeg-555">
+  <a href="LICENSE"><img alt="License: CC BY-NC-SA 4.0" src="https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey"></a>
 </p>
 
 <p align="center">
@@ -181,3 +182,14 @@ scripts/build-app.sh --install  # also copies it to /Applications
 ## Personal use
 
 TubeTunes is meant for building a personal library from videos you have the right to download. Please respect YouTube's Terms of Service and the rights of the artists.
+
+## License
+
+TubeTunes is licensed under [CC BY-NC-SA 4.0](LICENSE).
+
+- **You can:** use it, share it, and modify it however you like.
+- **Credit:** give credit to the original project.
+- **Non-commercial:** neither TubeTunes nor any modified version may be sold or used commercially.
+- **Share-alike:** modified versions must be released under this same license.
+
+yt-dlp and ffmpeg aren't included with TubeTunes; they're installed separately and keep their own licenses.
