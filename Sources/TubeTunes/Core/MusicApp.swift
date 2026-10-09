@@ -70,6 +70,12 @@ enum MusicApp {
         """)
     }
 
+    static func setTrackNumber(persistentID: String, _ number: Int) async {
+        _ = try? await run("""
+        tell application "Music" to set track number of (every track of library playlist 1 whose persistent ID is "\(esc(persistentID))") to \(number)
+        """)
+    }
+
     static func reveal(persistentID: String) async throws {
         try await run("""
         tell application "Music"

@@ -154,6 +154,7 @@ final class Engine {
             }
             prepare()
             Notifier.requestAuthorization()
+            await backfillTrackNumbers()
             pump()
             monitor = Task { [weak self] in
                 while !Task.isCancelled {
@@ -194,6 +195,7 @@ final class Engine {
     /// One headless pass: check due playlists, download/add anything new, then return.
     func runBackgroundPass() async {
         prepare()
+        await backfillTrackNumbers()
         await syncDuePlaylists()
         pump()
         while !active.isEmpty { try? await Task.sleep(for: .seconds(1)) }
@@ -352,6 +354,7 @@ final class Engine {
     /// Exports every included track and adds it to Music, replacing earlier versions and removing
     /// tracks that were deleted, merged away or unchecked in the editor since the last export.
     func exportAndAdd(_ id: UUID) async {
+        assignTrackNumbers(id)
         guard let item = lib.item(id), let sourceName = item.sourceFile else { return }
         let dir = lib.folder(for: id)
         let outDir = lib.exportFolder(for: id)
@@ -411,6 +414,65 @@ final class Engine {
                 $0.musicTrackIDs = Array(leftovers.union(added))
             }
         }
+    }
+
+    // MARK: - Track numbers
+
+    /// Tracks belong to the same album when album name and album artist match (ignoring case).
+    private func albumKey(_ s: Segment) -> String {
+        "\(s.album)\u{1}\(s.albumArtist.isEmpty ? s.artist : s.albumArtist)".lowercased()
+    }
+
+    /// Highest track number already used in that album by other downloads.
+    private func highestTrackNumber(in key: String, excluding itemID: UUID? = nil) -> Int {
+        lib.items.filter { $0.id != itemID }
+            .flatMap(\.segments)
+            .filter { albumKey($0) == key }
+            .compactMap(\.trackNumber)
+            .max() ?? 0
+    }
+
+    /// Gives every included track without a number the next free number in its album, in
+    /// timeline order, so a split video's songs play in order and new songs append after them.
+    private func assignTrackNumbers(_ id: UUID) {
+        guard var segs = lib.item(id)?.segments,
+              segs.contains(where: { $0.included && $0.trackNumber == nil }) else { return }
+        var next: [String: Int] = [:]
+        for i in segs.indices where segs[i].included && segs[i].trackNumber == nil {
+            let key = albumKey(segs[i])
+            let n = next[key] ?? max(highestTrackNumber(in: key, excluding: id),
+                                     segs.filter { albumKey($0) == key }.compactMap(\.trackNumber).max() ?? 0) + 1
+            segs[i].trackNumber = n
+            next[key] = n + 1
+        }
+        lib.update(id) { $0.segments = segs }
+    }
+
+    /// One-time fix for tracks added before every track got a number: numbers them in the order
+    /// they were added and sets the number on the existing Music track (no re-export).
+    func backfillTrackNumbers() async {
+        let flag = "backfilledTrackNumbers"
+        guard !UserDefaults.standard.bool(forKey: flag) else { return }
+        struct Candidate { let itemID: UUID; let segID: UUID; let pid: String; let key: String; let order: (Date, Date, Int) }
+        var candidates: [Candidate] = []
+        for item in lib.items {
+            for (offset, seg) in item.segments.enumerated() where seg.trackNumber == nil {
+                guard let pid = seg.musicPersistentID else { continue }
+                candidates.append(Candidate(itemID: item.id, segID: seg.id, pid: pid, key: albumKey(seg),
+                                            order: (seg.addedToMusicAt ?? item.completed ?? item.created,
+                                                    item.created, offset)))
+            }
+        }
+        candidates.sort { $0.order < $1.order }
+        var next: [String: Int] = [:]
+        for c in candidates {
+            let n = next[c.key] ?? highestTrackNumber(in: c.key) + 1
+            next[c.key] = n + 1
+            updateSegment(c.itemID, c.segID) { $0.trackNumber = n }
+            await MusicApp.setTrackNumber(persistentID: c.pid, n)
+        }
+        if !candidates.isEmpty { NSLog("Numbered \(candidates.count) existing track(s) in Music") }
+        UserDefaults.standard.set(true, forKey: flag)
     }
 
     private func updateSegment(_ id: UUID, _ segID: UUID, _ change: (inout Segment) -> Void) {
