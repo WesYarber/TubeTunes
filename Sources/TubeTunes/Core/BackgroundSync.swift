@@ -35,7 +35,7 @@ final class SyncLock {
 /// A classic agent is used instead of SMAppService because launchd pins SMAppService agents to the
 /// exact code signature, which breaks on every update of an ad-hoc signed app.
 enum BackgroundAgent {
-    static let label = "net.wesyarber.TubeTunes.sync"
+    static let label = "\(Bundle.main.bundleIdentifier ?? "net.wesyarber.TubeTunes").sync"
     private static let legacyService = SMAppService.agent(plistName: "\(label).plist")
 
     private static var plistURL: URL {

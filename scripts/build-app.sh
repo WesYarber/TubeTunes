@@ -24,7 +24,8 @@ if [[ ! -f build/AppIcon.icns ]]; then
 fi
 cp build/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
-codesign --force --sign - --identifier net.wesyarber.TubeTunes "$APP"
+BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" Resources/Info.plist)
+codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
 echo "Built $APP"
 
 if [[ "${1:-}" == "--install" ]]; then

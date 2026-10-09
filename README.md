@@ -1,6 +1,17 @@
 # TubeTunes
 
 A macOS app that downloads audio from YouTube videos and playlists, tags it, and adds it to Apple Music.
+Monitored playlists keep syncing in the background, so new songs land in your library on their own.
+
+## Quick start
+```bash
+brew install yt-dlp ffmpeg
+git clone https://github.com/WesYarber/TubeTunes.git
+cd TubeTunes
+scripts/build-app.sh --install
+open /Applications/TubeTunes.app
+```
+Requires macOS 14 or later and the Xcode command-line tools (Swift 5.10+).
 
 ## Features
 - **Best audio:** downloads the best audio stream YouTube offers (usually Opus) and converts it once to AAC 256 kbps (or 192/320, or Apple Lossless) in `.m4a`.
@@ -32,7 +43,7 @@ A macOS app that downloads audio from YouTube videos and playlists, tags it, and
   - Opening a download turns the window into the editor. ‹ Back returns to the list and offers Save / Don't Save if there are unsaved edits.
   - Edits stay in TubeTunes until **Update in Music**, which replaces the tracks in Music.
 - **Background sync:**
-  - A per-user launchd agent (`~/Library/LaunchAgents/net.wesyarber.TubeTunes.sync.plist`) wakes every 5 minutes at background priority, even when the app is quit.
+  - A per-user launchd agent (`~/Library/LaunchAgents/<bundle id>.sync.plist`) wakes every 5 minutes at background priority, even when the app is quit.
   - It exits within milliseconds unless a playlist is due for its check interval or downloads are queued. It skips work in Low Power Mode.
   - Only one process touches the library at a time: when the app is open, the agent leaves the work to it.
   - Log: `~/Library/Logs/TubeTunes-sync.log`. Turn it off in Settings › General.
@@ -49,6 +60,12 @@ scripts/build-app.sh            # builds build/TubeTunes.app
 scripts/build-app.sh --install  # also copies it to /Applications
 ```
 The first time a track is added, macOS asks to let TubeTunes control Music. The app is ad-hoc signed, so a rebuild may ask again.
+
+## Forking
+The bundle identifier (`net.wesyarber.TubeTunes`) lives in `Resources/Info.plist`. The build script and the background agent's label both read it from there, so changing it in that one place is enough.
+
+## Personal use
+TubeTunes is meant for building a personal library from videos you have the right to download. Respect YouTube's Terms of Service and the rights of the artists.
 
 ## Data
 `~/Library/Application Support/TubeTunes/`:
